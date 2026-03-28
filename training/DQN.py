@@ -18,6 +18,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 from engine import *
+from reward import compute_reward
 from utils import plot_loss, plot_rewards, plot_win_rates, plot_moving_average
 from agent import SimpleRuleAgent, SmarterRuleAgent, TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent
 
@@ -232,50 +233,6 @@ class DQNAgent:
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.global_step = checkpoint["global_step"]
         self.epsilon = checkpoint["epsilon"]
-
-    
-
-def compute_reward(prev_obs, curr_obs, agent_id):
-    """
-    Args:
-        prev_obs: {map, players, bombs} before an action
-        curr_obs: {map, players, bombs} after an action
-        agent_id
-    """
-    if prev_obs is None:
-        return 0.0
-
-    prev_players = prev_obs["players"]
-    curr_players = curr_obs["players"]
-    prev_alive = int(prev_players[agent_id][2])
-    curr_alive = int(curr_players[agent_id][2])
-
-    reward = 0.0
-    # win/loss
-    if prev_alive == 1 and curr_alive == 0:
-        reward -= 2.0
-    # stand still penalty
-    if prev_obs["players"][agent_id][0] == curr_obs["players"][agent_id][0] and \
-       prev_obs["players"][agent_id][1] == curr_obs["players"][agent_id][1]:
-        reward -= 0.05
-    else:   
-        reward += 0.025
-    # small time penalty
-    reward -= 0.01
-    # box destruction progress (global proxy)
-    prev_boxes = int(np.sum((prev_obs["map"]) == Map.BOX))
-    curr_boxes = int(np.sum((curr_obs["map"]) == Map.BOX))
-    boxes_destroyed = max(0, prev_boxes - curr_boxes)
-    reward += 0.05 * boxes_destroyed
-    # item collection proxy via player stats deltas
-    prev_bombs_left = int(prev_players[agent_id][3])
-    curr_bombs_left = int(curr_players[agent_id][3])
-    prev_radius_bonus = int(prev_players[agent_id][4])
-    curr_radius_bonus = int(curr_players[agent_id][4])
-    reward += 0.05 * max(0, curr_bombs_left - prev_bombs_left)
-    reward += 0.05 * max(0, curr_radius_bonus - prev_radius_bonus)
-    return float(reward)
-
     
 
 BOMB_MAX_TIMER = 7  # matches Bomb.__init__ default timer
