@@ -18,6 +18,7 @@ from engine import BomberEnv
 from agent import RandomAgent, SimpleRuleAgent, SmarterRuleAgent, TacticalRuleAgent, GeniusRuleAgent, BoxFarmerAgent
 from training import encode_obs, DQNAgent, DQfDAgent
 from training.SQIL import encode_obs as sqil_encode_obs
+from training.bc_ppo_lstm import BC_PPO_LSTM_Agent, is_bc_ppo_lstm_checkpoint
 
 class Viewer:
 	def __init__(self, width=13, height=13, cell_size=42, fps=8):
@@ -191,15 +192,21 @@ def make_agents(model_paths, seed=None):
 	if seed is not None:
 		random.seed(seed)
 
+	dev = "cuda" if torch.cuda.is_available() else "cpu"
 	for i, path in enumerate(model_paths):
 		if path != "None":
 			checkpoint = torch.load(path, map_location="cpu")
-			input_dim = checkpoint["input_dim"]
-			num_actions = checkpoint["num_actions"]
-			# agents[i] = DQNAgent(i, input_dim, num_actions, lr=1e-3, device="cuda" if torch.cuda.is_available() else "cpu", pretrained_model=path)
-			agents[i] = DQfDAgent(i, input_dim, num_actions, lr=1e-3, device="cuda" if torch.cuda.is_available() else "cpu", pretrained_model=path)
-			agents[i].load_agent(pretrained_model=path)
-			names[i] = os.path.basename(path)
+			if is_bc_ppo_lstm_checkpoint(checkpoint):
+				agents[i] = BC_PPO_LSTM_Agent(i, path, device=dev)
+				names[i] = os.path.basename(path)
+			else:
+				input_dim = checkpoint.get("input_dim", checkpoint.get("input_shape"))
+				num_actions = checkpoint["num_actions"]
+				agents[i] = DQfDAgent(
+					i, input_dim, num_actions, lr=1e-3, device=dev, pretrained_model=path
+				)
+				agents[i].load_agent(pretrained_model=path)
+				names[i] = os.path.basename(path)
 		else:
 			x = random.randint(0, 6)
 			if x == 0:
@@ -310,6 +317,9 @@ def simulate_episodes(model_paths, num_episodes=10, max_steps=500, seed=None):
 	for episode in range(num_episodes):
 		episode_seed = None if seed is None else seed + episode
 		obs = env.reset(seed=episode_seed)
+		for ag in agents:
+			if ag is not None and hasattr(ag, "reset_memory"):
+				ag.reset_memory()
 		done = False
 		step = 0
 		trajectory = [clone_obs(obs)]
@@ -317,7 +327,7 @@ def simulate_episodes(model_paths, num_episodes=10, max_steps=500, seed=None):
 		while not done and step < max_steps:
 			actions = []
 			for i in range(len(agents)):
-				if isinstance(agents[i], (DQNAgent, DQfDAgent)):
+				if isinstance(agents[i], (DQNAgent, DQfDAgent, BC_PPO_LSTM_Agent)):
 					opp_ids = [pid for pid in range(num_agents) if pid != i]
 					encoded = _encode_for_model_agent(obs, i, opp_ids, agents[i])
 					if isinstance(encoded, tuple) and len(encoded) == 2:
@@ -413,7 +423,9 @@ def run_simple_viewer(model_paths, num_episodes=10, max_steps=100, seed=None, au
 
 
 if __name__ == "__main__":
-	parser = argparse.ArgumentParser()
+	parser = argparse.ArgumentParser(
+		description="Local viewer. model_paths: DQfD/SQIL .pth or BC+PPO+LSTM ckpts (final.pth / after_bc.pth)."
+	)
 	parser.add_argument("--model_paths", nargs="+", default=["None", "None", "None", "None"])
 	parser.add_argument("--num_episodes", type=int, default=10)
 	parser.add_argument("--max_steps", type=int, default=500)

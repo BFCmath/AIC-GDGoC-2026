@@ -261,7 +261,17 @@ def pretrain_bc_lstm(
 
 def save_checkpoint(path: str, model, optimizer, meta: dict):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    payload = {"model_state_dict": model.state_dict(), "meta": meta}
+    meta = dict(meta)
+    meta.setdefault("num_actions", NUM_ACTIONS)
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "meta": meta,
+        "agent_type": "bc_ppo_lstm",
+        "num_actions": int(meta["num_actions"]),
+    }
+    if meta.get("input_spec") is not None:
+        payload["input_shape"] = meta["input_spec"]
+        payload["input_spec"] = meta["input_spec"]
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
     torch.save(payload, path)
@@ -275,6 +285,58 @@ def load_checkpoint(path: str, model, device, optimizer=None):
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     print(f"Loaded checkpoint {path}")
     return ckpt.get("meta", {})
+
+
+def is_bc_ppo_lstm_checkpoint(ckpt: dict) -> bool:
+    """True for BC+PPO+LSTM saves (visualizer / eval)."""
+    if ckpt.get("agent_type") == "bc_ppo_lstm":
+        return True
+    meta = ckpt.get("meta")
+    if isinstance(meta, dict) and "lstm_hidden" in meta and "input_spec" in meta:
+        return True
+    return False
+
+
+class BC_PPO_LSTM_Agent:
+    """Greedy / ε-greedy policy wrapper for evaluation (carries LSTM state within an episode)."""
+
+    def __init__(self, agent_id: int, checkpoint_path: str, device: str | None = None):
+        self.agent_id = int(agent_id)
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        meta = ckpt.get("meta", {})
+        input_spec = meta.get("input_spec") or ckpt.get("input_shape")
+        if input_spec is None:
+            raise ValueError(f"Checkpoint {checkpoint_path!r} missing meta['input_spec'] or input_shape")
+        map_shape = tuple(input_spec[0])
+        aux_dim = int(input_spec[1])
+        lstm_hidden = int(meta.get("lstm_hidden", 256))
+        lstm_layers = int(meta.get("lstm_layers", 1))
+        num_actions = int(meta.get("num_actions", ckpt.get("num_actions", NUM_ACTIONS)))
+        self.map_shape = map_shape
+        self.aux_dim = aux_dim
+        self.num_actions = num_actions
+        self.model = ActorCriticLSTM(
+            map_shape, aux_dim, num_actions, lstm_hidden=lstm_hidden, lstm_layers=lstm_layers
+        ).to(self.device)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.model.eval()
+        self._hidden: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def reset_memory(self) -> None:
+        """Call at each new episode so the LSTM does not carry over across games."""
+        self._hidden = None
+
+    def act(self, map_state, aux_state, epsilon: float = 0.0) -> int:
+        if self._hidden is None:
+            self._hidden = self.model.init_hidden(1, self.device)
+        m = torch.from_numpy(map_state).float().unsqueeze(0).to(self.device)
+        aux = torch.from_numpy(aux_state).float().unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logits, _, self._hidden = self.model.forward_step(m, aux, self._hidden)
+        if random.random() < epsilon:
+            return random.randint(0, self.num_actions - 1)
+        return int(logits.argmax(dim=-1).item())
 
 
 def train_bc_ppo_lstm(
