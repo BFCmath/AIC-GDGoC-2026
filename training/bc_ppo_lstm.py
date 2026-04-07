@@ -51,7 +51,7 @@ BC_CLASS_WEIGHTS = torch.tensor([0.3, 1.0, 1.0, 1.0, 1.0, 2.0], dtype=torch.floa
 
 
 class MapEncoder(nn.Module):
-    """CNN trunk matching SQIL DQN map path (pooled spatial features only)."""
+    """Light CNN: stem + 2 residual stages + global average pool (feat_dim = 2 * base)."""
 
     def __init__(self, map_shape):
         super().__init__()
@@ -103,24 +103,24 @@ class MapEncoder(nn.Module):
                 layers.append(_ResBlock(out_ch, out_ch, stride=1))
             return nn.Sequential(*layers)
 
-        base = 64
+        base = 32
+        blocks_per_stage = 1
         self.map_stem = nn.Sequential(
             nn.Conv2d(c, base, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(base),
             nn.ReLU(inplace=True),
         )
-        self.map_stage1 = _make_stage(base, base, blocks=2, stride=1)
-        self.map_stage2 = _make_stage(base, base * 2, blocks=2, stride=2)
-        self.map_stage3 = _make_stage(base * 2, base * 4, blocks=2, stride=2)
+        # Two stages after stem (no third downsample block): stem → s1 → s2 → GAP
+        self.map_stage1 = _make_stage(base, base, blocks=blocks_per_stage, stride=1)
+        self.map_stage2 = _make_stage(base, base * 2, blocks=blocks_per_stage, stride=2)
         self.map_pool = nn.AdaptiveAvgPool2d(1)
         self.map_dropout = nn.Dropout(p=0.1)
-        self.feat_dim = base * 4
+        self.feat_dim = base * 2
 
     def forward(self, map_x: torch.Tensor) -> torch.Tensor:
         x = self.map_stem(map_x)
         x = self.map_stage1(x)
         x = self.map_stage2(x)
-        x = self.map_stage3(x)
         feat = self.map_pool(x).flatten(1)
         return self.map_dropout(feat)
 

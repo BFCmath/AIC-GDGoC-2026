@@ -21,14 +21,18 @@ from training.SQIL import encode_obs as sqil_encode_obs
 from training.bc_ppo_lstm import BC_PPO_LSTM_Agent, is_bc_ppo_lstm_checkpoint
 
 class Viewer:
-	def __init__(self, width=13, height=13, cell_size=42, fps=8):
+	PLAYER_COLORS = [(220, 50, 50), (50, 50, 220), (30, 150, 30), (200, 140, 0)]
+
+	def __init__(self, width=13, height=13, cell_size=42, fps=8, panel_width=200):
 		self.width = width
 		self.height = height
 		self.cell_size = cell_size
 		self.fps = fps
+		self.panel_width = panel_width
 
 		self.top_bar = 60
-		self.screen_width = width * cell_size
+		self.grid_width = width * cell_size
+		self.screen_width = self.grid_width + panel_width
 		self.screen_height = height * cell_size + self.top_bar
 
 		pygame.init()
@@ -73,7 +77,6 @@ class Viewer:
 					pygame.draw.rect(self.screen, (120, 200, 120), rect, 1)
 
 	def draw_players(self, players):
-		colors = [(220, 50, 50), (50, 50, 220), (30, 150, 30), (200, 140, 0)]
 		for i, p in enumerate(players):
 			if p[2] != 1:
 				continue
@@ -81,7 +84,7 @@ class Viewer:
 				int(p[1]) * self.cell_size + self.cell_size // 2,
 				int(p[0]) * self.cell_size + self.top_bar + self.cell_size // 2,
 			)
-			pygame.draw.circle(self.screen, colors[i % len(colors)], center, self.cell_size // 3)
+			pygame.draw.circle(self.screen, self.PLAYER_COLORS[i % len(self.PLAYER_COLORS)], center, self.cell_size // 3)
 			img = self.font_small.render(str(i), True, (255, 255, 255))
 			self.screen.blit(img, (center[0] - 5, center[1] - 8))
 			stats_text = f"B:{int(p[3])} R:{int(p[4])}"
@@ -99,6 +102,40 @@ class Viewer:
 			pygame.draw.circle(self.screen, (20, 20, 20), center, self.cell_size // 4)
 			timer_img = self.font_small.render(str(int(b[2])), True, (255, 255, 255))
 			self.screen.blit(timer_img, (center[0] - 5, center[1] - 8))
+
+	def draw_agent_sidebar(self, players, agent_names):
+		"""Right panel: agent name, alive/dead, bombs available, radius power-up bonus."""
+		x0 = self.grid_width
+		pygame.draw.rect(self.screen, (52, 58, 64), (x0, 0, self.panel_width, self.screen_height))
+		pygame.draw.line(self.screen, (30, 30, 30), (x0, 0), (x0, self.screen_height), 2)
+
+		title = self.font_info.render("Agents", True, (245, 245, 245))
+		self.screen.blit(title, (x0 + 10, self.top_bar + 8))
+
+		y = self.top_bar + 40
+		line_h = 22
+		for i, p in enumerate(players):
+			name = agent_names[i] if i < len(agent_names) and agent_names[i] else f"Agent {i}"
+			alive = int(p[2]) == 1
+			bombs_left = int(p[3])
+			radius_bonus = int(p[4])
+			color = self.PLAYER_COLORS[i % len(self.PLAYER_COLORS)]
+
+			pygame.draw.circle(self.screen, color, (x0 + 14, y + 8), 6)
+			name_img = self.font_small.render(str(name)[:28], True, (240, 240, 240))
+			self.screen.blit(name_img, (x0 + 28, y))
+			y += line_h
+
+			status = "Alive" if alive else "Dead"
+			status_color = (120, 220, 140) if alive else (220, 100, 100)
+			status_img = self.font_small.render(status, True, status_color)
+			self.screen.blit(status_img, (x0 + 10, y))
+			y += line_h
+
+			stats = f"Bombs: {bombs_left}  |  +Radius: {radius_bonus}"
+			stats_img = self.font_small.render(stats, True, (200, 200, 200))
+			self.screen.blit(stats_img, (x0 + 10, y))
+			y += line_h + 10
 
 	def draw_header(self, episode_idx, total_episodes, step_idx, total_steps, paused):
 		pygame.draw.rect(self.screen, (30, 30, 30), (0, 0, self.screen_width, self.top_bar))
@@ -159,13 +196,14 @@ class Viewer:
 			center = (px + self.cell_size // 2, py + self.cell_size // 2)
 			pygame.draw.circle(self.screen, (255, 220, 120), center, self.cell_size // 6)
 
-	def render(self, obs, prev_obs, episode_idx, total_episodes, step_idx, total_steps, paused):
+	def render(self, obs, prev_obs, episode_idx, total_episodes, step_idx, total_steps, paused, agent_names):
 		self.screen.fill((245, 245, 245))
 		self.draw_grid(obs["map"])
 		explosion_tiles = self._explosion_tiles_from_transition(prev_obs, obs)
 		self.draw_explosions(explosion_tiles)
 		self.draw_players(obs["players"])
 		self.draw_bombs(obs["bombs"])
+		self.draw_agent_sidebar(obs["players"], agent_names)
 		self.draw_header(episode_idx, total_episodes, step_idx, total_steps, paused)
 		pygame.display.flip()
 		self.clock.tick(self.fps)
@@ -417,6 +455,7 @@ def run_simple_viewer(model_paths, num_episodes=10, max_steps=100, seed=None, au
 			step_idx=step_idx,
 			total_steps=len(episodes[episode_idx]),
 			paused=paused,
+			agent_names=agent_names,
 		)
 
 	viewer.close()
