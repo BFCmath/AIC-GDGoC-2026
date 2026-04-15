@@ -51,7 +51,19 @@ except ImportError:
     from reward_02 import EpisodeRewardState, compute_reward_icec
     from utils import plot_loss, plot_moving_average, plot_rewards
 
-BC_CLASS_WEIGHTS = torch.tensor([0.3, 1.0, 1.0, 1.0, 1.0, 2.0], dtype=torch.float32)
+BC_BASE_CLASS_WEIGHTS = torch.tensor([0.3, 1.0, 1.0, 1.0, 1.0, 1.8], dtype=torch.float32)
+
+
+def _build_bc_class_weights(actions: np.ndarray, device: str) -> torch.Tensor:
+    """Compute robust class weights from demo frequencies and keep a mild bomb boost."""
+    counts = np.bincount(actions.astype(np.int64), minlength=NUM_ACTIONS).astype(np.float32)
+    counts = np.maximum(counts, 1.0)
+    inv = counts.sum() / (NUM_ACTIONS * counts)
+    inv = inv / np.mean(inv)
+    data_weights = torch.from_numpy(inv).to(device)
+    weights = data_weights * BC_BASE_CLASS_WEIGHTS.to(device)
+    # Keep bounds tight to avoid unstable BC updates on very rare classes.
+    return torch.clamp(weights, min=0.25, max=4.0)
 
 
 class MapEncoder(nn.Module):
@@ -210,7 +222,8 @@ def pretrain_bc_lstm(
     idx = np.random.permutation(n)
     split = int(n * (1 - val_ratio))
     train_idx, val_idx = idx[:split], idx[split:]
-    weights = BC_CLASS_WEIGHTS.to(device)
+    weights = _build_bc_class_weights(bc_data["action"], device)
+    print(f"  BC class weights: {weights.detach().cpu().numpy().round(3).tolist()}")
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6,
@@ -668,8 +681,8 @@ if __name__ == "__main__":
         help="One type (broadcast to all 3 bots) or three types: one per enemy id in "
         "ascending order among slots other than --user_id (e.g. user 0 → ids 1,2,3).",
     )
-    parser.add_argument("--demo_episodes", type=int, default=100)
-    parser.add_argument("--bc_epochs", type=int, default=15)
+    parser.add_argument("--demo_episodes", type=int, default=1000)
+    parser.add_argument("--bc_epochs", type=int, default=12)
     parser.add_argument("--ppo_updates", type=int, default=2000)
     parser.add_argument("--ppo_steps", type=int, default=256)
     parser.add_argument("--parallel_envs", type=int, default=4,
@@ -682,7 +695,7 @@ if __name__ == "__main__":
     parser.add_argument("--gae_lambda", type=float, default=0.95)
     parser.add_argument("--clip_coef", type=float, default=0.2)
     parser.add_argument("--vf_coef", type=float, default=0.5)
-    parser.add_argument("--ent_coef", type=float, default=0.03)
+    parser.add_argument("--ent_coef", type=float, default=0.04)
     parser.add_argument("--ppo_epochs", type=int, default=4)
     parser.add_argument(
         "--minibatch_size",
