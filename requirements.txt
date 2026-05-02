@@ -10,4 +10,8 @@ google-auth-oauthlib>=0.4.0
 google-api-python-client>=2.0.0
 pytest>=6.0.0
 Flask>=2.2.0
+tensorflow>=2.15.0
+stable-baselines3>=2.2.1
+gymnasium>=0.29.1
+tensorboard>=2.15.0
 # ngrok

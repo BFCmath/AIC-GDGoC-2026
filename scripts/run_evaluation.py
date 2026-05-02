@@ -23,8 +23,9 @@ load_env()
 
 DEFAULT_DB_PATH = str(ROOT_DIR / "competition.db")
 DEFAULT_LOG_DIR = str(ROOT_DIR / "logs")
+EVALUATION_LOCK_FILE = ROOT_DIR / ".evaluation_lock"
 
-DEFAULT_N_MATCHES = 50
+DEFAULT_N_MATCHES = 25
 DEFAULT_MAX_STEPS = 500
 DEFAULT_NEAR_DELTA = 3.0
 DEFAULT_TOP_K = 10
@@ -233,6 +234,11 @@ def run_submission_batch(
     enable_gif: bool = True,
     enable_timing_logs: bool = True,
 ):
+    try:
+        EVALUATION_LOCK_FILE.touch(exist_ok=True)
+    except Exception as e:
+        logger.warning("Could not create evaluation lock: %s", e)
+
     total_started = time.perf_counter()
     parallel_workers = max(1, int(parallel_workers))
     timing_stages: dict[str, float] = {}
@@ -477,6 +483,12 @@ def run_submission_batch(
             include_baseline=True,
         )
 
+    try:
+        if EVALUATION_LOCK_FILE.exists():
+            EVALUATION_LOCK_FILE.unlink()
+    except Exception as e:
+        logger.warning("Could not remove evaluation lock: %s", e)
+
     return result
 
 
@@ -496,6 +508,9 @@ def run_background_cycle(
     enable_gif: bool = True,
     enable_timing_logs: bool = True,
 ):
+    if EVALUATION_LOCK_FILE.exists():
+        return {"status": "skipped", "message": "Yielding to submission batch (lock file present)."}
+
     total_started = time.perf_counter()
     parallel_workers = max(1, int(parallel_workers))
     timing_stages: dict[str, float] = {}

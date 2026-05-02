@@ -18,10 +18,11 @@ from competition.storage import SubmissionStore
 MAX_ZIP_SIZE_BYTES = 100 * 1024 * 1024
 MAX_EXTRACTED_TOTAL_BYTES = 300 * 1024 * 1024
 MAX_SINGLE_FILE_BYTES = 150 * 1024 * 1024
-MAX_FILE_COUNT = 200
+MAX_FILE_COUNT = 20
 
 ALLOWED_EXTENSIONS = {
-    ".py", ".txt", ".pt", ".pth", ".pkl", ".onnx", ".bin", ".json", ".yaml", ".yml", ".md"
+    ".py", ".txt", ".pt", ".pth", ".pkl", ".onnx", ".bin", ".json", ".yaml", ".yml", ".md",
+    ".h5", ".pb", ".keras", ".tflite"
 }
 
 

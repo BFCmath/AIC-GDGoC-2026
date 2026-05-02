@@ -176,6 +176,7 @@ def process_submission_webhook(
 
             evaluation_result = run_submission_batch(
                 submission_id=submission_id,
+                n_matches=25,
                 db_path=store.db_path,
                 update_sheet=True,
                 sheet_credentials_file=sheet_credentials_file,
