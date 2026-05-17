@@ -35,6 +35,34 @@ DEFAULT_INFERENCE_TIMEOUT_S = 0.1
 logger = logging.getLogger(__name__)
 
 
+def _prewarm_drive_folders() -> None:
+    """Pre-create the Drive folder structure (json/ and gifs/) in the parent process.
+
+    When parallel workers all finish matches simultaneously and try to upload JSONs
+    at the same time, they race to create the same Drive subfolder. Google Drive's
+    files.list() is eventually consistent, so two workers can both see 'folder not
+    found' and each create a duplicate. GIFs don't suffer because rendering time
+    naturally staggers those uploads.
+
+    Calling this once in the parent process before dispatching workers ensures the
+    folders exist in Drive. Workers will find them via list() which has had the
+    entire match execution time (~20 s) to propagate.
+    """
+    drive_folder_id = os.getenv("DRIVE_FOLDER_ID", "").strip()
+    if not drive_folder_id:
+        return
+    try:
+        from datetime import datetime, timezone
+        from competition.integrations.drive_upload import get_drive_service, ensure_drive_folder
+        service = get_drive_service()
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for artifact in ("json", "gifs"):
+            root_id = ensure_drive_folder(service, drive_folder_id, artifact)
+            ensure_drive_folder(service, root_id, date_str)
+    except Exception as e:
+        logger.warning("Drive folder pre-warm failed (uploads will still work, may create duplicate folders): %s", e)
+
+
 def _score(mu: float, sigma: float) -> float:
     return float(mu) - 3.0 * float(sigma)
 
@@ -376,6 +404,17 @@ def run_submission_batch(
 
     stage_started = time.perf_counter()
     if parallel_workers > 1 and jobs:
+        _prewarm_drive_folders()
+        # Clear the cached Drive service so neither the forked workers nor the parent
+        # reuse the TCP connections opened during pre-warm.  Forked workers inherit
+        # open socket FDs; if they (or the parent) try to reuse those sockets after
+        # another process has closed its copy, the result is [Errno 32] Broken pipe.
+        # After this clear, every process builds a fresh service with its own sockets.
+        try:
+            from competition.integrations.drive_upload import _build_drive_service
+            _build_drive_service.cache_clear()
+        except Exception:
+            pass
         _log_timing(enable_timing_logs, f"running {len(jobs)} matches with {parallel_workers} parallel workers")
         with concurrent.futures.ProcessPoolExecutor(max_workers=parallel_workers) as executor:
             futures = [executor.submit(_run_single_match_job, job) for job in jobs]
@@ -579,6 +618,12 @@ def run_background_cycle(
 
     stage_started = time.perf_counter()
     if parallel_workers > 1 and jobs:
+        _prewarm_drive_folders()
+        try:
+            from competition.integrations.drive_upload import _build_drive_service
+            _build_drive_service.cache_clear()
+        except Exception:
+            pass
         _log_timing(enable_timing_logs, f"running background {len(jobs)} matches with {parallel_workers} workers")
         with concurrent.futures.ProcessPoolExecutor(max_workers=parallel_workers) as executor:
             futures = [executor.submit(_run_single_match_job, job) for job in jobs]
