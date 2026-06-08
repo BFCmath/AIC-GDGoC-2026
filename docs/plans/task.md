@@ -1,0 +1,6 @@
+| id | task | status | notes |
+| --- | --- | --- | --- |
+| update-script | Update train_bc_ppo.py (expert, symmetries, safety mask, shaped reward, opponent pool, fallback integration) | done | All features implemented in scripts/participant/train_bc_ppo.py |
+| update-notebook | Update colab/base.ipynb to match training script changes and handle fallback file copying | done | Successfully synchronized notebook cells with train_bc_ppo.py |
+| run-verification | Run verification smoke test command | done | Smoke test passes; local match vs 4.py/Tactical/Genius gets 6/10 wins |
+| document-changes | Document changes in walkthrough.md | done | Walkthrough created in brain directory |
