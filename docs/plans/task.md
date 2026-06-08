@@ -5,3 +5,4 @@
 | run-verification | Run verification smoke test command | done | Smoke test passes; local match vs 4.py/Tactical/Genius gets 6/10 wins |
 | document-changes | Document changes in walkthrough.md | done | Walkthrough created in brain directory |
 | track-experts | Add agent/codex/3.py and agent/codex/4.py to git and push to origin | done | Pushed expert agents to remote |
+| benchmark-new-agents | Benchmark the new agents and fix their runtime/loading bugs | done | Benchmarked all 5 agents; fixed bugs in deepseek 2, grok 1, and gemini 1 |
