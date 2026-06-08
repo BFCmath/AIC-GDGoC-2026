@@ -1,0 +1,814 @@
+"""BC + PPO trainer for the hybrid Bomberland agent.
+
+This script is the stable entrypoint intended for Colab:
+
+    python scripts/participant/train_bc_ppo.py --mode full --device cuda
+
+It keeps the training approach from ``docs/dl_approach.md`` practical:
+behavior cloning from strong rule/search agents, PPO fine-tuning, and export
+of a CPU-safe submission bundle.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import random
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+from agent import (
+    BoxFarmerAgent,
+    GeniusRuleAgent,
+    RandomAgent,
+    SimpleRuleAgent,
+    SmarterRuleAgent,
+    TacticalRuleAgent,
+)
+from competition.evaluation.runtime_guard import load_agent_instance, runtime_precheck
+from engine.game import BomberEnv
+from engine.map import Map
+from engine.player import Player
+
+ACTIONS = 6
+BOARD = 13
+BOMB_TIMER = 7
+MAX_RADIUS = 5
+SPATIAL_CHANNELS = 26
+SCALAR_DIM = 13
+MOVES = {
+    0: (0, 0),
+    1: (-1, 0),
+    2: (1, 0),
+    3: (0, -1),
+    4: (0, 1),
+}
+
+EXPERT_SPECS = [
+    "agent/codex/1.py",
+    "agent/codex/2.py",
+    "TacticalRuleAgent",
+    "GeniusRuleAgent",
+    "SmarterRuleAgent",
+    "BoxFarmerAgent",
+]
+
+OPPONENT_SPECS = [
+    "agent/codex/1.py",
+    "agent/codex/2.py",
+    "TacticalRuleAgent",
+    "GeniusRuleAgent",
+    "SmarterRuleAgent",
+    "BoxFarmerAgent",
+    "SimpleRuleAgent",
+]
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_agent_from_file(path: str | Path, agent_id: int):
+    path = ROOT / path if not Path(path).is_absolute() else Path(path)
+    spec = importlib.util.spec_from_file_location(f"expert_{path.stem}_{agent_id}_{time.time_ns()}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load agent from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Agent(agent_id)
+
+
+def make_builtin_agent(name: str, agent_id: int):
+    mapping = {
+        "RandomAgent": RandomAgent,
+        "SimpleRuleAgent": SimpleRuleAgent,
+        "SmarterRuleAgent": SmarterRuleAgent,
+        "TacticalRuleAgent": TacticalRuleAgent,
+        "GeniusRuleAgent": GeniusRuleAgent,
+        "BoxFarmerAgent": BoxFarmerAgent,
+    }
+    return mapping[name](agent_id)
+
+
+def make_agent(spec: str, agent_id: int):
+    if spec.endswith(".py") or "/" in spec:
+        return load_agent_from_file(spec, agent_id)
+    return make_builtin_agent(spec, agent_id)
+
+
+def in_bounds(grid, x, y):
+    return 0 <= x < grid.shape[0] and 0 <= y < grid.shape[1]
+
+
+def passable(grid, x, y):
+    return in_bounds(grid, x, y) and int(grid[x, y]) in (
+        Map.GRASS,
+        Map.ITEM_RADIUS,
+        Map.ITEM_CAPACITY,
+    )
+
+
+def next_pos(pos, action):
+    dx, dy = MOVES.get(int(action), (0, 0))
+    return pos[0] + dx, pos[1] + dy
+
+
+def bomb_positions(bombs):
+    arr = np.asarray(bombs)
+    return {(int(b[0]), int(b[1])) for b in arr.reshape(-1, 4)} if arr.size else set()
+
+
+def bomb_radius(players, owner_id):
+    owner_id = int(owner_id)
+    if 0 <= owner_id < len(players):
+        return max(1, min(MAX_RADIUS, 1 + int(players[owner_id][4])))
+    return 2
+
+
+def blast_tiles(grid, bx, by, radius):
+    tiles = {(int(bx), int(by))}
+    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        for step in range(1, int(radius) + 1):
+            x, y = int(bx) + dx * step, int(by) + dy * step
+            if not in_bounds(grid, x, y):
+                break
+            cell = int(grid[x, y])
+            if cell == Map.WALL:
+                break
+            tiles.add((x, y))
+            if cell == Map.BOX:
+                break
+    return tiles
+
+
+def danger_schedule(grid, bombs, players, horizon=7, extra_bomb=None):
+    schedule = {t: set() for t in range(1, horizon + 1)}
+    bomb_list = []
+    arr = np.asarray(bombs)
+    if arr.size:
+        for b in arr.reshape(-1, 4):
+            bomb_list.append(
+                {
+                    "pos": (int(b[0]), int(b[1])),
+                    "timer": max(1, int(b[2])),
+                    "radius": bomb_radius(players, int(b[3])),
+                }
+            )
+    if extra_bomb is not None:
+        pos, radius, timer = extra_bomb
+        bomb_list.append({"pos": tuple(pos), "timer": max(1, int(timer)), "radius": int(radius)})
+
+    times = [b["timer"] for b in bomb_list]
+    changed = True
+    while changed:
+        changed = False
+        for i, bomb in enumerate(bomb_list):
+            tiles = blast_tiles(grid, bomb["pos"][0], bomb["pos"][1], bomb["radius"])
+            for j, other in enumerate(bomb_list):
+                if i != j and other["pos"] in tiles and times[j] > times[i]:
+                    times[j] = times[i]
+                    changed = True
+
+    for bomb, timer in zip(bomb_list, times):
+        if 1 <= timer <= horizon:
+            schedule[timer].update(blast_tiles(grid, bomb["pos"][0], bomb["pos"][1], bomb["radius"]))
+    return schedule
+
+
+def boxes_hit_if_bomb(grid, pos, radius):
+    return sum(1 for x, y in blast_tiles(grid, pos[0], pos[1], radius) if int(grid[x, y]) == Map.BOX)
+
+
+def enemies_hit_if_bomb(grid, players, agent_id, pos, radius):
+    tiles = blast_tiles(grid, pos[0], pos[1], radius)
+    return sum(
+        1
+        for i, player in enumerate(players)
+        if i != agent_id and int(player[2]) == 1 and (int(player[0]), int(player[1])) in tiles
+    )
+
+
+def safe_bfs_action(obs, agent_id, horizon=8, extra_bomb=None):
+    grid, players, bombs = obs["map"], obs["players"], obs["bombs"]
+    start = (int(players[agent_id][0]), int(players[agent_id][1]))
+    danger = danger_schedule(grid, bombs, players, horizon=horizon, extra_bomb=extra_bomb)
+    blocked = bomb_positions(bombs)
+    queue = deque([(start, 0, None)])
+    seen = {(start, 0)}
+    while queue:
+        pos, tick, first = queue.popleft()
+        future_bad = any(pos in danger.get(t, set()) for t in range(tick + 1, horizon + 1))
+        if tick > 0 and not future_bad:
+            return first if first is not None else 0
+        if tick >= horizon:
+            continue
+        for action in [0, 1, 2, 3, 4]:
+            npos = next_pos(pos, action)
+            if not passable(grid, npos[0], npos[1]):
+                continue
+            if npos in blocked and npos != start:
+                continue
+            if npos in danger.get(tick + 1, set()):
+                continue
+            state = (npos, tick + 1)
+            if state in seen:
+                continue
+            seen.add(state)
+            queue.append((npos, tick + 1, action if first is None else first))
+    return None
+
+
+def can_escape_after_bomb(obs, agent_id):
+    player = obs["players"][agent_id]
+    pos = (int(player[0]), int(player[1]))
+    radius = 1 + int(player[4])
+    return safe_bfs_action(obs, agent_id, horizon=8, extra_bomb=(pos, radius, BOMB_TIMER)) is not None
+
+
+def legal_action_mask(obs, agent_id, veto_bombs=True):
+    grid, players, bombs = obs["map"], obs["players"], obs["bombs"]
+    mask = np.zeros(ACTIONS, dtype=np.bool_)
+    if agent_id >= len(players) or int(players[agent_id][2]) != 1:
+        mask[0] = True
+        return mask
+
+    player = players[agent_id]
+    pos = (int(player[0]), int(player[1]))
+    blocked = bomb_positions(bombs)
+    mask[0] = True
+    for action in [1, 2, 3, 4]:
+        npos = next_pos(pos, action)
+        if passable(grid, npos[0], npos[1]) and npos not in blocked:
+            mask[action] = True
+
+    if int(player[3]) > 0 and pos not in blocked:
+        mask[5] = True
+        if veto_bombs:
+            radius = 1 + int(player[4])
+            useful = boxes_hit_if_bomb(grid, pos, radius) > 0 or enemies_hit_if_bomb(
+                grid, players, agent_id, pos, radius
+            ) > 0
+            mask[5] = useful and can_escape_after_bomb(obs, agent_id)
+
+    if not mask.any():
+        mask[0] = True
+    return mask
+
+
+def forced_safety_action(obs, agent_id):
+    if agent_id >= len(obs["players"]) or int(obs["players"][agent_id][2]) != 1:
+        return 0
+    pos = (int(obs["players"][agent_id][0]), int(obs["players"][agent_id][1]))
+    danger = danger_schedule(obs["map"], obs["bombs"], obs["players"], horizon=7)
+    if any(pos in danger[t] for t in danger):
+        escape = safe_bfs_action(obs, agent_id, horizon=8)
+        if escape is not None:
+            return int(escape)
+    return None
+
+
+def nearest_distance(start, targets, default=13):
+    if not targets:
+        return float(default)
+    return float(min(abs(start[0] - t[0]) + abs(start[1] - t[1]) for t in targets))
+
+
+def reachable_cells(obs, agent_id, max_depth=3):
+    grid, players, bombs = obs["map"], obs["players"], obs["bombs"]
+    start = (int(players[agent_id][0]), int(players[agent_id][1]))
+    blocked = bomb_positions(bombs)
+    queue = deque([(start, 0)])
+    seen = {start}
+    depths = {start: 0}
+    while queue:
+        pos, depth = queue.popleft()
+        if depth >= max_depth:
+            continue
+        for action in [1, 2, 3, 4]:
+            npos = next_pos(pos, action)
+            if npos in seen or npos in blocked or not passable(grid, npos[0], npos[1]):
+                continue
+            seen.add(npos)
+            depths[npos] = depth + 1
+            queue.append((npos, depth + 1))
+    return depths
+
+
+def encode_observation(obs, agent_id, step_count=0, max_steps=500):
+    grid, players, bombs = obs["map"], obs["players"], obs["bombs"]
+    height, width = grid.shape
+    spatial = np.zeros((SPATIAL_CHANNELS, height, width), dtype=np.float32)
+    spatial[0] = grid == Map.GRASS
+    spatial[1] = grid == Map.WALL
+    spatial[2] = grid == Map.BOX
+    spatial[3] = grid == Map.ITEM_RADIUS
+    spatial[4] = grid == Map.ITEM_CAPACITY
+
+    player = players[agent_id]
+    pos = (int(player[0]), int(player[1]))
+    if int(player[2]) == 1:
+        spatial[5, pos[0], pos[1]] = 1.0
+
+    channel = 6
+    for idx, other in enumerate(players):
+        if idx != agent_id and int(other[2]) == 1 and channel <= 8:
+            spatial[channel, int(other[0]), int(other[1])] = 1.0
+            channel += 1
+
+    arr = np.asarray(bombs)
+    if arr.size:
+        for bomb in arr.reshape(-1, 4):
+            bx, by, timer, owner = int(bomb[0]), int(bomb[1]), int(bomb[2]), int(bomb[3])
+            spatial[9, bx, by] = 1.0
+            spatial[10, bx, by] = float(timer) / BOMB_TIMER
+            spatial[11, bx, by] = bomb_radius(players, owner) / MAX_RADIUS
+            spatial[12 if owner == agent_id else 13, bx, by] = 1.0
+
+    danger = danger_schedule(grid, bombs, players, horizon=7)
+    for timer in range(1, 8):
+        for dx, dy in danger[timer]:
+            spatial[13 + timer, dx, dy] = 1.0
+
+    depths = reachable_cells(obs, agent_id, max_depth=3)
+    for cell, depth in depths.items():
+        if depth <= 1:
+            spatial[21, cell[0], cell[1]] = 1.0
+        if depth <= 2:
+            spatial[22, cell[0], cell[1]] = 1.0
+        spatial[23, cell[0], cell[1]] = 1.0
+
+    radius = 1 + int(player[4])
+    for bx, by in blast_tiles(grid, pos[0], pos[1], radius):
+        spatial[24, bx, by] = 1.0
+
+    unsafe = set().union(*danger.values()) if danger else set()
+    for sx, sy in set(depths) - unsafe:
+        spatial[25, sx, sy] = 1.0
+
+    enemies = [(int(p[0]), int(p[1])) for i, p in enumerate(players) if i != agent_id and int(p[2]) == 1]
+    items = [(x, y) for x in range(height) for y in range(width) if int(grid[x, y]) in (Map.ITEM_RADIUS, Map.ITEM_CAPACITY)]
+    box_spots = []
+    for x in range(height):
+        for y in range(width):
+            if int(grid[x, y]) != Map.BOX:
+                continue
+            for action in [1, 2, 3, 4]:
+                candidate = next_pos((x, y), action)
+                if passable(grid, candidate[0], candidate[1]):
+                    box_spots.append(candidate)
+
+    current_danger = min([timer for timer in danger if pos in danger[timer]], default=0)
+    boxes_hit = boxes_hit_if_bomb(grid, pos, radius)
+    enemies_hit = enemies_hit_if_bomb(grid, players, agent_id, pos, radius)
+    scalar = np.array(
+        [
+            agent_id / 3.0,
+            min(float(step_count) / max_steps, 1.0),
+            float(player[3]) / Player.MAX_BOMB_CAPACITY,
+            float(radius) / MAX_RADIUS,
+            len(enemies) / 3.0,
+            nearest_distance(pos, enemies) / 24.0,
+            nearest_distance(pos, items) / 24.0,
+            nearest_distance(pos, box_spots) / 24.0,
+            float(current_danger) / BOMB_TIMER,
+            float(can_escape_after_bomb(obs, agent_id)) if int(player[3]) > 0 else 0.0,
+            min(float(boxes_hit), 5.0) / 5.0,
+            min(float(enemies_hit), 3.0) / 3.0,
+            float(int(player[2]) == 1),
+        ],
+        dtype=np.float32,
+    )
+    return spatial, scalar
+
+
+class PolicyValueNet(nn.Module):
+    def __init__(self, spatial_channels=SPATIAL_CHANNELS, scalar_dim=SCALAR_DIM, num_actions=ACTIONS):
+        super().__init__()
+        self.map_encoder = nn.Sequential(
+            nn.Conv2d(spatial_channels, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.scalar_encoder = nn.Sequential(
+            nn.Linear(scalar_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+        )
+        self.trunk = nn.Sequential(nn.Linear(64 * BOARD * BOARD + 64, 256), nn.ReLU())
+        self.policy = nn.Linear(256, num_actions)
+        self.value = nn.Linear(256, 1)
+
+    def forward(self, spatial, scalar):
+        map_feat = self.map_encoder(spatial).flatten(1)
+        scalar_feat = self.scalar_encoder(scalar)
+        feat = self.trunk(torch.cat([map_feat, scalar_feat], dim=1))
+        return self.policy(feat), self.value(feat).squeeze(-1)
+
+
+def masked_logits(logits, masks):
+    return logits.masked_fill(~masks.bool(), -1e9)
+
+
+class ExpertDataset(Dataset):
+    def __init__(self, spatial, scalar, masks, actions):
+        self.spatial = torch.from_numpy(np.asarray(spatial, dtype=np.float32))
+        self.scalar = torch.from_numpy(np.asarray(scalar, dtype=np.float32))
+        self.masks = torch.from_numpy(np.asarray(masks, dtype=np.bool_))
+        self.actions = torch.from_numpy(np.asarray(actions, dtype=np.int64))
+
+    def __len__(self):
+        return len(self.actions)
+
+    def __getitem__(self, idx):
+        return self.spatial[idx], self.scalar[idx], self.masks[idx], self.actions[idx]
+
+
+def collect_expert_dataset(num_matches, max_steps, seed):
+    env = BomberEnv(max_steps=max_steps, seed=seed)
+    spatial_rows, scalar_rows, mask_rows, action_rows = [], [], [], []
+    skipped = 0
+    for match in range(num_matches):
+        specs = [random.choice(EXPERT_SPECS) for _ in range(4)]
+        experts = [make_agent(specs[i], i) for i in range(4)]
+        obs = env.reset(seed=seed + match)
+        for step in range(max_steps):
+            actions = []
+            for agent_id, expert in enumerate(experts):
+                try:
+                    action = int(expert.act(obs))
+                except Exception:
+                    action = 0
+                action = action if 0 <= action < ACTIONS else 0
+                actions.append(action)
+                if int(obs["players"][agent_id][2]) != 1:
+                    continue
+                mask = legal_action_mask(obs, agent_id, veto_bombs=True)
+                if not mask[action]:
+                    skipped += 1
+                    continue
+                spatial, scalar = encode_observation(obs, agent_id, step, max_steps=max_steps)
+                spatial_rows.append(spatial)
+                scalar_rows.append(scalar)
+                mask_rows.append(mask)
+                action_rows.append(action)
+            obs, terminated, truncated = env.step(actions)
+            if terminated or truncated:
+                break
+        if (match + 1) % max(1, num_matches // 10) == 0:
+            print(f"BC collection {match + 1}/{num_matches}: {len(action_rows)} samples, skipped={skipped}")
+    return ExpertDataset(spatial_rows, scalar_rows, mask_rows, action_rows)
+
+
+def train_behavior_cloning(model, dataset, device, epochs, batch_size, lr, grad_clip):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    model.train()
+    for epoch in range(epochs):
+        total_loss, total_correct, total_seen = 0.0, 0, 0
+        for spatial, scalar, masks, actions in loader:
+            spatial, scalar = spatial.to(device), scalar.to(device)
+            masks, actions = masks.to(device), actions.to(device)
+            logits, _ = model(spatial, scalar)
+            logits = masked_logits(logits, masks)
+            loss = F.cross_entropy(logits, actions)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            opt.step()
+            total_loss += float(loss.item()) * len(actions)
+            total_correct += int((logits.argmax(dim=-1) == actions).sum().item())
+            total_seen += len(actions)
+        print(f"BC epoch {epoch + 1}/{epochs}: loss={total_loss / max(total_seen, 1):.4f}, acc={total_correct / max(total_seen, 1):.3f}")
+
+
+def sample_masked_action(model, spatial, scalar, mask, deterministic=False):
+    logits, value = model(spatial, scalar)
+    logits = masked_logits(logits, mask)
+    dist = torch.distributions.Categorical(logits=logits)
+    action = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
+    return action, dist.log_prob(action), dist.entropy(), value
+
+
+def rank_players(env):
+    survivors = [i for i, p in enumerate(env.players) if p.alive]
+    stats_key = lambda i: (
+        env.players[i].stats["kills"],
+        env.players[i].stats["boxes"],
+        env.players[i].stats["items"],
+        env.players[i].stats["bombs"],
+    )
+    ranks = [3] * 4
+    if survivors:
+        ordered = sorted(survivors, key=stats_key, reverse=True)
+        rank = 0
+        for idx, pid in enumerate(ordered):
+            if idx > 0 and stats_key(pid) < stats_key(ordered[idx - 1]):
+                rank = idx
+            ranks[pid] = rank
+    dead = [i for i in range(4) if i not in survivors]
+    base = max([ranks[i] for i in survivors], default=-1) + 1
+    for offset, pid in enumerate(dead):
+        ranks[pid] = base + offset
+    return ranks
+
+
+def shaped_reward(prev_obs, obs, env, agent_id, action, done):
+    if prev_obs is None:
+        return 0.0
+    prev_p = prev_obs["players"][agent_id]
+    cur_p = obs["players"][agent_id]
+    reward = 0.015 if int(prev_p[2]) == 1 else 0.0
+    if int(prev_p[2]) == 1 and int(cur_p[2]) == 0:
+        reward -= 8.0
+    prev_enemies = sum(1 for i, p in enumerate(prev_obs["players"]) if i != agent_id and int(p[2]) == 1)
+    cur_enemies = sum(1 for i, p in enumerate(obs["players"]) if i != agent_id and int(p[2]) == 1)
+    reward += 3.0 * max(0, prev_enemies - cur_enemies)
+    if int(cur_p[3]) > int(prev_p[3]) or int(cur_p[4]) > int(prev_p[4]):
+        reward += 0.25
+    if action == 5:
+        radius = 1 + int(prev_p[4])
+        pos = (int(prev_p[0]), int(prev_p[1]))
+        reward += 0.12 * boxes_hit_if_bomb(prev_obs["map"], pos, radius)
+        reward += 0.5 * enemies_hit_if_bomb(prev_obs["map"], prev_obs["players"], agent_id, pos, radius)
+        if not can_escape_after_bomb(prev_obs, agent_id):
+            reward -= 1.0
+    if done:
+        reward += {0: 10.0, 1: 2.0, 2: -2.0, 3: -6.0}.get(rank_players(env)[agent_id], -6.0)
+    return float(reward)
+
+
+@dataclass
+class PPOBatch:
+    spatial: list
+    scalar: list
+    masks: list
+    actions: list
+    logprobs: list
+    rewards: list
+    dones: list
+    values: list
+
+
+class NeuralSafeAgent:
+    def __init__(self, agent_id, model, device, deterministic=False):
+        self.agent_id = int(agent_id)
+        self.model = model
+        self.device = device
+        self.deterministic = deterministic
+        self.step_count = 0
+
+    def act(self, obs):
+        forced = forced_safety_action(obs, self.agent_id)
+        if forced is not None:
+            return int(forced)
+        spatial, scalar = encode_observation(obs, self.agent_id, self.step_count)
+        mask = legal_action_mask(obs, self.agent_id, veto_bombs=True)
+        with torch.inference_mode():
+            s = torch.from_numpy(spatial).unsqueeze(0).to(self.device)
+            a = torch.from_numpy(scalar).unsqueeze(0).to(self.device)
+            m = torch.from_numpy(mask).unsqueeze(0).to(self.device)
+            action, _, _, _ = sample_masked_action(self.model, s, a, m, deterministic=self.deterministic)
+        self.step_count += 1
+        return int(action.item())
+
+
+def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed):
+    batch = PPOBatch([], [], [], [], [], [], [], [])
+    model.eval()
+    for env_idx in range(envs):
+        control_id = random.randrange(4)
+        env = BomberEnv(max_steps=max_steps, seed=seed + env_idx)
+        obs = env.reset(seed=seed + env_idx)
+        agents = [
+            NeuralSafeAgent(i, model, device) if i == control_id else make_agent(random.choice(OPPONENT_SPECS), i)
+            for i in range(4)
+        ]
+        prev_obs = None
+        for step in range(horizon):
+            actions = []
+            record = None
+            for i, agent in enumerate(agents):
+                if i == control_id:
+                    forced = forced_safety_action(obs, i)
+                    spatial, scalar = encode_observation(obs, i, step, max_steps=max_steps)
+                    mask = legal_action_mask(obs, i, veto_bombs=True)
+                    with torch.no_grad():
+                        action_t, logprob_t, _, value_t = sample_masked_action(
+                            model,
+                            torch.from_numpy(spatial).unsqueeze(0).to(device),
+                            torch.from_numpy(scalar).unsqueeze(0).to(device),
+                            torch.from_numpy(mask).unsqueeze(0).to(device),
+                        )
+                    action = int(forced) if forced is not None else int(action_t.item())
+                    record = (spatial, scalar, mask, action, float(logprob_t.item()), float(value_t.item()))
+                else:
+                    try:
+                        action = int(agent.act(obs))
+                    except Exception:
+                        action = 0
+                actions.append(action if 0 <= action < ACTIONS else 0)
+            next_obs, terminated, truncated = env.step(actions)
+            done = bool(terminated or truncated)
+            reward = shaped_reward(prev_obs, next_obs, env, control_id, actions[control_id], done)
+            if record is not None:
+                batch.spatial.append(record[0])
+                batch.scalar.append(record[1])
+                batch.masks.append(record[2])
+                batch.actions.append(record[3])
+                batch.logprobs.append(record[4])
+                batch.values.append(record[5])
+                batch.rewards.append(reward)
+                batch.dones.append(done)
+            prev_obs = obs
+            obs = next_obs
+            if done:
+                break
+    return batch
+
+
+def compute_gae(rewards, dones, values, gamma, gae_lambda):
+    rewards = np.asarray(rewards, dtype=np.float32)
+    dones = np.asarray(dones, dtype=np.float32)
+    values = np.asarray(values, dtype=np.float32)
+    advantages = np.zeros_like(rewards)
+    last_gae = 0.0
+    next_value = 0.0
+    for tick in reversed(range(len(rewards))):
+        nonterminal = 1.0 - dones[tick]
+        delta = rewards[tick] + gamma * next_value * nonterminal - values[tick]
+        last_gae = delta + gamma * gae_lambda * nonterminal * last_gae
+        advantages[tick] = last_gae
+        next_value = values[tick]
+    returns = advantages + values
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    return advantages.astype(np.float32), returns.astype(np.float32)
+
+
+def train_ppo(model, device, args):
+    opt = torch.optim.AdamW(model.parameters(), lr=args.ppo_lr, weight_decay=1e-4)
+    for update in range(args.ppo_updates):
+        batch = collect_ppo_rollout(
+            model,
+            device=device,
+            horizon=args.ppo_horizon,
+            envs=args.ppo_envs_per_update,
+            max_steps=args.max_steps,
+            seed=args.seed + 10000 * update,
+        )
+        if not batch.actions:
+            print(f"PPO {update + 1}/{args.ppo_updates}: empty rollout")
+            continue
+        advantages, returns = compute_gae(batch.rewards, batch.dones, batch.values, args.gamma, args.gae_lambda)
+        spatial = torch.from_numpy(np.asarray(batch.spatial, dtype=np.float32)).to(device)
+        scalar = torch.from_numpy(np.asarray(batch.scalar, dtype=np.float32)).to(device)
+        masks = torch.from_numpy(np.asarray(batch.masks, dtype=np.bool_)).to(device)
+        actions = torch.tensor(batch.actions, dtype=torch.long, device=device)
+        old_logprobs = torch.tensor(batch.logprobs, dtype=torch.float32, device=device)
+        advantages_t = torch.from_numpy(advantages).to(device)
+        returns_t = torch.from_numpy(returns).to(device)
+        indices = np.arange(len(actions))
+        model.train()
+        for _ in range(args.ppo_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, len(indices), args.ppo_minibatch_size):
+                mb = indices[start : start + args.ppo_minibatch_size]
+                logits, values = model(spatial[mb], scalar[mb])
+                dist = torch.distributions.Categorical(logits=masked_logits(logits, masks[mb]))
+                logprobs = dist.log_prob(actions[mb])
+                ratio = (logprobs - old_logprobs[mb]).exp()
+                pg1 = ratio * advantages_t[mb]
+                pg2 = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps) * advantages_t[mb]
+                policy_loss = -torch.min(pg1, pg2).mean()
+                value_loss = F.mse_loss(values, returns_t[mb])
+                loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * dist.entropy().mean()
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                opt.step()
+        print(f"PPO {update + 1}/{args.ppo_updates}: reward_mean={np.mean(batch.rewards):.3f}, samples={len(actions)}")
+
+
+EXPORT_AGENT_TEMPLATE = "\nfrom collections import deque\nfrom pathlib import Path\nimport numpy as np\nimport torch\nimport torch.nn as nn\n\nACTIONS = 6\nBOARD = 13\nBOMB_TIMER = 7\nMAX_RADIUS = 5\nSPATIAL_CHANNELS = 26\nSCALAR_DIM = 13\nMOVES = {0: (0, 0), 1: (-1, 0), 2: (1, 0), 3: (0, -1), 4: (0, 1)}\nGRASS, WALL, BOX, ITEM_RADIUS, ITEM_CAPACITY = 0, 1, 2, 3, 4\n\nclass PolicyValueNet(nn.Module):\n    def __init__(self, spatial_channels=SPATIAL_CHANNELS, scalar_dim=SCALAR_DIM, num_actions=ACTIONS):\n        super().__init__()\n        self.map_encoder = nn.Sequential(\n            nn.Conv2d(spatial_channels, 32, 3, padding=1), nn.ReLU(),\n            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),\n            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(),\n        )\n        self.scalar_encoder = nn.Sequential(nn.Linear(scalar_dim, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU())\n        self.trunk = nn.Sequential(nn.Linear(64 * BOARD * BOARD + 64, 256), nn.ReLU())\n        self.policy = nn.Linear(256, num_actions)\n        self.value = nn.Linear(256, 1)\n    def forward(self, spatial, scalar):\n        mf = self.map_encoder(spatial).flatten(1)\n        sf = self.scalar_encoder(scalar)\n        feat = self.trunk(torch.cat([mf, sf], dim=1))\n        return self.policy(feat), self.value(feat).squeeze(-1)\n\ndef _inb(g, x, y): return 0 <= x < g.shape[0] and 0 <= y < g.shape[1]\ndef _pass(g, x, y): return _inb(g, x, y) and int(g[x, y]) in (GRASS, ITEM_RADIUS, ITEM_CAPACITY)\ndef _next(pos, a):\n    dx, dy = MOVES.get(int(a), (0, 0)); return pos[0] + dx, pos[1] + dy\ndef _bomb_pos(bombs):\n    arr = np.asarray(bombs)\n    return {(int(b[0]), int(b[1])) for b in arr.reshape(-1, 4)} if arr.size else set()\ndef _radius(players, owner):\n    owner = int(owner)\n    return max(1, min(MAX_RADIUS, 1 + int(players[owner][4]))) if 0 <= owner < len(players) else 2\ndef _blast(g, bx, by, r):\n    tiles = {(int(bx), int(by))}\n    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:\n        for k in range(1, int(r) + 1):\n            x, y = int(bx) + dx * k, int(by) + dy * k\n            if not _inb(g, x, y): break\n            cell = int(g[x, y])\n            if cell == WALL: break\n            tiles.add((x, y))\n            if cell == BOX: break\n    return tiles\ndef _danger(g, bombs, players, horizon=7, extra=None):\n    sched = {t: set() for t in range(1, horizon + 1)}\n    bl = []\n    arr = np.asarray(bombs)\n    if arr.size:\n        for b in arr.reshape(-1, 4):\n            bl.append(((int(b[0]), int(b[1])), max(1, int(b[2])), _radius(players, int(b[3]))))\n    if extra is not None:\n        pos, r, timer = extra; bl.append((tuple(pos), max(1, int(timer)), int(r)))\n    times = [b[1] for b in bl]\n    changed = True\n    while changed:\n        changed = False\n        for i, (pos, _, r) in enumerate(bl):\n            bt = _blast(g, pos[0], pos[1], r)\n            for j, (opos, _, _) in enumerate(bl):\n                if i != j and opos in bt and times[j] > times[i]:\n                    times[j] = times[i]; changed = True\n    for (pos, _, r), t in zip(bl, times):\n        if 1 <= t <= horizon:\n            sched[t].update(_blast(g, pos[0], pos[1], r))\n    return sched\ndef _safe_bfs(obs, aid, horizon=8, extra=None):\n    g, players, bombs = obs['map'], obs['players'], obs['bombs']\n    start = (int(players[aid][0]), int(players[aid][1]))\n    danger = _danger(g, bombs, players, horizon, extra)\n    blocked = _bomb_pos(bombs)\n    q = deque([(start, 0, None)]); seen = {(start, 0)}\n    while q:\n        pos, t, first = q.popleft()\n        if t > 0 and not any(pos in danger.get(tt, set()) for tt in range(t + 1, horizon + 1)):\n            return first if first is not None else 0\n        if t >= horizon: continue\n        for a in [0, 1, 2, 3, 4]:\n            np_ = _next(pos, a)\n            if not _pass(g, np_[0], np_[1]): continue\n            if np_ in blocked and np_ != start: continue\n            if np_ in danger.get(t + 1, set()): continue\n            st = (np_, t + 1)\n            if st in seen: continue\n            seen.add(st); q.append((np_, t + 1, a if first is None else first))\n    return None\ndef _can_escape_bomb(obs, aid):\n    p = obs['players'][aid]; pos = (int(p[0]), int(p[1])); r = 1 + int(p[4])\n    return _safe_bfs(obs, aid, 8, (pos, r, BOMB_TIMER)) is not None\ndef _boxes_hit(g, pos, r): return sum(1 for x, y in _blast(g, pos[0], pos[1], r) if int(g[x, y]) == BOX)\ndef _enemies_hit(g, players, aid, pos, r):\n    bt = _blast(g, pos[0], pos[1], r)\n    return sum(1 for i, p in enumerate(players) if i != aid and int(p[2]) == 1 and (int(p[0]), int(p[1])) in bt)\ndef _mask(obs, aid):\n    g, players, bombs = obs['map'], obs['players'], obs['bombs']\n    out = np.zeros(ACTIONS, dtype=np.bool_)\n    if aid >= len(players) or int(players[aid][2]) != 1:\n        out[0] = True; return out\n    p = players[aid]; pos = (int(p[0]), int(p[1])); bp = _bomb_pos(bombs)\n    out[0] = True\n    for a in [1, 2, 3, 4]:\n        np_ = _next(pos, a)\n        if _pass(g, np_[0], np_[1]) and np_ not in bp: out[a] = True\n    if int(p[3]) > 0 and pos not in bp:\n        r = 1 + int(p[4]); useful = _boxes_hit(g, pos, r) > 0 or _enemies_hit(g, players, aid, pos, r) > 0\n        out[5] = useful and _can_escape_bomb(obs, aid)\n    if not out.any(): out[0] = True\n    return out\ndef _nearest(start, targets, default=13):\n    if not targets: return float(default)\n    return float(min(abs(start[0] - t[0]) + abs(start[1] - t[1]) for t in targets))\ndef _reachable(obs, aid, depth=3):\n    g, players, bombs = obs['map'], obs['players'], obs['bombs']\n    start = (int(players[aid][0]), int(players[aid][1])); blocked = _bomb_pos(bombs)\n    q = deque([(start, 0)]); seen = {start}; depths = {start: 0}\n    while q:\n        pos, d = q.popleft()\n        if d >= depth: continue\n        for a in [1, 2, 3, 4]:\n            np_ = _next(pos, a)\n            if np_ in seen or np_ in blocked or not _pass(g, np_[0], np_[1]): continue\n            seen.add(np_); depths[np_] = d + 1; q.append((np_, d + 1))\n    return depths\ndef _encode(obs, aid, step_count):\n    g, players, bombs = obs['map'], obs['players'], obs['bombs']; h, w = g.shape\n    x = np.zeros((SPATIAL_CHANNELS, h, w), dtype=np.float32)\n    x[0] = (g == GRASS); x[1] = (g == WALL); x[2] = (g == BOX); x[3] = (g == ITEM_RADIUS); x[4] = (g == ITEM_CAPACITY)\n    p = players[aid]; pos = (int(p[0]), int(p[1]))\n    if int(p[2]) == 1: x[5, pos[0], pos[1]] = 1.0\n    ch = 6\n    for i, op in enumerate(players):\n        if i != aid and int(op[2]) == 1 and ch <= 8:\n            x[ch, int(op[0]), int(op[1])] = 1.0; ch += 1\n    arr = np.asarray(bombs)\n    if arr.size:\n        for b in arr.reshape(-1, 4):\n            bx, by, timer, owner = int(b[0]), int(b[1]), int(b[2]), int(b[3])\n            x[9, bx, by] = 1.0; x[10, bx, by] = float(timer) / BOMB_TIMER; x[11, bx, by] = _radius(players, owner) / MAX_RADIUS\n            x[12 if owner == aid else 13, bx, by] = 1.0\n    danger = _danger(g, bombs, players, 7)\n    for t in range(1, 8):\n        for dx, dy in danger[t]: x[13 + t, dx, dy] = 1.0\n    depths = _reachable(obs, aid, 3)\n    for rp, d in depths.items():\n        if d <= 1: x[21, rp[0], rp[1]] = 1.0\n        if d <= 2: x[22, rp[0], rp[1]] = 1.0\n        x[23, rp[0], rp[1]] = 1.0\n    r = 1 + int(p[4])\n    for bx, by in _blast(g, pos[0], pos[1], r): x[24, bx, by] = 1.0\n    unsafe = set().union(*danger.values()) if danger else set()\n    for sx, sy in set(depths) - unsafe: x[25, sx, sy] = 1.0\n    enemies = [(int(op[0]), int(op[1])) for i, op in enumerate(players) if i != aid and int(op[2]) == 1]\n    items = [(i, j) for i in range(h) for j in range(w) if int(g[i, j]) in (ITEM_RADIUS, ITEM_CAPACITY)]\n    box_spots = []\n    for i in range(h):\n        for j in range(w):\n            if int(g[i, j]) == BOX:\n                for a in [1, 2, 3, 4]:\n                    bp = _next((i, j), a)\n                    if _pass(g, bp[0], bp[1]): box_spots.append(bp)\n    current_danger = min([t for t in danger if pos in danger[t]], default=0)\n    scalar = np.array([aid / 3.0, min(step_count / 500.0, 1.0), float(p[3]) / 5.0, float(r) / MAX_RADIUS, len(enemies) / 3.0, _nearest(pos, enemies) / 24.0, _nearest(pos, items) / 24.0, _nearest(pos, box_spots) / 24.0, float(current_danger) / BOMB_TIMER, float(_can_escape_bomb(obs, aid)) if int(p[3]) > 0 else 0.0, min(float(_boxes_hit(g, pos, r)), 5.0) / 5.0, min(float(_enemies_hit(g, players, aid, pos, r)), 3.0) / 3.0, float(int(p[2]) == 1)], dtype=np.float32)\n    return x, scalar\ndef _forced(obs, aid):\n    if aid >= len(obs['players']) or int(obs['players'][aid][2]) != 1: return 0\n    pos = (int(obs['players'][aid][0]), int(obs['players'][aid][1]))\n    danger = _danger(obs['map'], obs['bombs'], obs['players'], 7)\n    if any(pos in danger[t] for t in danger):\n        esc = _safe_bfs(obs, aid, 8)\n        if esc is not None: return int(esc)\n    return None\n\nclass Agent:\n    team_id = \"HybridBCPPO\"\n    def __init__(self, agent_id: int):\n        self.agent_id = int(agent_id)\n        self.step_count = 0\n        self.device = torch.device('cpu')\n        self.model = PolicyValueNet()\n        ckpt = torch.load(Path(__file__).with_name('model.pt'), map_location='cpu')\n        state = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt\n        self.model.load_state_dict(state)\n        self.model.eval()\n    def act(self, obs):\n        try:\n            forced = _forced(obs, self.agent_id)\n            if forced is not None:\n                return int(forced)\n            spatial, scalar = _encode(obs, self.agent_id, self.step_count)\n            mask = _mask(obs, self.agent_id)\n            with torch.inference_mode():\n                s = torch.from_numpy(spatial).unsqueeze(0)\n                a = torch.from_numpy(scalar).unsqueeze(0)\n                logits, _ = self.model(s, a)\n                logits = logits.masked_fill(~torch.from_numpy(mask).unsqueeze(0).bool(), -1e9)\n                action = int(torch.argmax(logits, dim=-1).item())\n            self.step_count += 1\n            return action if 0 <= action <= 5 else 0\n        except Exception:\n            return 0\n"
+
+def export_agent(model, export_dir):
+    export_path = Path(export_dir)
+    export_path.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.cpu().state_dict(),
+            "spatial_channels": SPATIAL_CHANNELS,
+            "scalar_dim": SCALAR_DIM,
+            "actions": ACTIONS,
+        },
+        export_path / "model.pt",
+    )
+    (export_path / "agent.py").write_text(EXPORT_AGENT_TEMPLATE)
+    print(f"Exported to {export_path}")
+    return export_path
+
+
+def smoke_test_export(export_dir, matches=2, max_steps=60):
+    agent_file = Path(export_dir) / "agent.py"
+    ok, message = runtime_precheck(str(agent_file), timeout_s=0.1, startup_timeout_s=3.0)
+    print("Runtime precheck:", ok, message)
+    env = BomberEnv(max_steps=max_steps, seed=123)
+    agents = [load_agent_instance(str(agent_file), 0), TacticalRuleAgent(1), GeniusRuleAgent(2), SmarterRuleAgent(3)]
+    survival = 0
+    for match in range(matches):
+        obs = env.reset(seed=123 + match)
+        for _ in range(max_steps):
+            actions = []
+            for agent in agents:
+                try:
+                    actions.append(int(agent.act(obs)))
+                except Exception:
+                    actions.append(0)
+            obs, terminated, truncated = env.step(actions)
+            if terminated or truncated:
+                break
+        survival += int(bool(obs["players"][0][2]))
+    print(f"Smoke survival: {survival}/{matches}")
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="Train a hybrid BC + PPO Bomberland agent")
+    parser.add_argument("--mode", choices=["bc", "ppo", "full", "export", "smoke"], default="full")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--seed", type=int, default=86)
+    parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument("--bc-matches", type=int, default=120)
+    parser.add_argument("--bc-epochs", type=int, default=4)
+    parser.add_argument("--bc-batch-size", type=int, default=512)
+    parser.add_argument("--bc-lr", type=float, default=3e-4)
+    parser.add_argument("--ppo-updates", type=int, default=80)
+    parser.add_argument("--ppo-envs-per-update", type=int, default=16)
+    parser.add_argument("--ppo-horizon", type=int, default=256)
+    parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--ppo-minibatch-size", type=int, default=512)
+    parser.add_argument("--ppo-lr", type=float, default=2.5e-4)
+    parser.add_argument("--gamma", type=float, default=0.995)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--clip-eps", type=float, default=0.2)
+    parser.add_argument("--vf-coef", type=float, default=0.5)
+    parser.add_argument("--ent-coef", type=float, default=0.015)
+    parser.add_argument("--grad-clip", type=float, default=0.5)
+    parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--save-checkpoint", default="checkpoints/hybrid_bc_ppo.pt")
+    parser.add_argument("--export-dir", default="exports/hybrid_ppo_agent")
+    parser.add_argument("--smoke-matches", type=int, default=2)
+    return parser
+
+
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+    seed_everything(args.seed)
+    device = torch.device(args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+    model = PolicyValueNet().to(device)
+    if args.checkpoint:
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+    if args.mode in {"bc", "full"}:
+        dataset = collect_expert_dataset(args.bc_matches, args.max_steps, args.seed)
+        train_behavior_cloning(model, dataset, device, args.bc_epochs, args.bc_batch_size, args.bc_lr, args.grad_clip)
+        Path(args.save_checkpoint).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model_state_dict": model.state_dict()}, args.save_checkpoint)
+        print(f"Saved checkpoint to {args.save_checkpoint}")
+
+    if args.mode in {"ppo", "full"}:
+        train_ppo(model, device, args)
+        Path(args.save_checkpoint).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model_state_dict": model.state_dict()}, args.save_checkpoint)
+        print(f"Saved checkpoint to {args.save_checkpoint}")
+
+    if args.mode in {"export", "full", "smoke"}:
+        export_agent(model, args.export_dir)
+
+    if args.mode == "smoke":
+        smoke_test_export(args.export_dir, matches=args.smoke_matches)
+
+
+if __name__ == "__main__":
+    main()

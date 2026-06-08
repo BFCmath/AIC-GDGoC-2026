@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 logs/
 .venv
+venv/
 ckpts/
 .vscode/
 *.db
@@ -11,5 +12,4 @@ secrets/
 submissions/
 .drive_locks/
 backups/
-tests/
 training/

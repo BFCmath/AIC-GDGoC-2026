@@ -1,0 +1,285 @@
+# GDGoC-HCMUS AI Challenge 2026 — BomberGame / Bom IT Agent Context
+
+## 1. Tổng quan cuộc thi
+
+**Tên cuộc thi:** GDGoC-HCMUS AI Challenge 2026
+**Đơn vị tổ chức:** Google Developer Group on Campus, University of Science – VNUHCM, Team AI&DS – Ban Development
+**Chủ đề:** Học tăng cường / Reinforcement Learning
+**Bài toán:** Xây dựng agent tự động cho môi trường game đối kháng nhiều đội, lấy cảm hứng từ trò chơi Bom IT / Bomberman.
+
+Mục tiêu của agent là đưa ra chiến thuật theo thời gian thực để:
+
+* Di chuyển hợp lý trên bản đồ.
+* Đặt bom để phá hộp hoặc loại đối thủ.
+* Né tránh vùng nguy hiểm do bom nổ.
+* Thu thập vật phẩm hỗ trợ.
+* Sinh tồn càng lâu càng tốt.
+* Loại bỏ các agent đối thủ.
+
+## 2. Hình thức thi
+
+Mỗi đội có tối đa **2 thành viên**.
+
+Mỗi trận đấu gồm:
+
+* **4 đội**.
+* Mỗi đội điều khiển **1 agent**.
+* Tổng cộng **4 agent** trong một trận.
+
+Agent có thể thực hiện các nhóm hành vi chính:
+
+* Di chuyển.
+* Đặt bom.
+* Phá thùng / hộp.
+* Thu thập vật phẩm tăng sức mạnh.
+
+## 3. Quy trình cuộc thi
+
+### Vòng 1 — Huấn luyện & Thi đấu
+
+**Thời gian:** 21/5 – 21/6.
+
+BTC cung cấp:
+
+* Tài liệu hướng dẫn.
+* Baseline agent.
+* Hướng dẫn tương tác với môi trường.
+* Tài liệu học Reinforcement Learning.
+* Participant kit, gồm engine, visualizer, v.v.
+* Hướng dẫn dùng Kaggle / Colab để huấn luyện mô hình.
+
+Trong vòng này:
+
+* BTC đóng vai trò mentor và hỗ trợ các đội.
+* Các đội có thể nộp bài nhiều lần.
+* Agent sẽ được tự động thi đấu với agent của đội khác hoặc baseline agent.
+* Bảng xếp hạng được cập nhật dựa trên kết quả thi đấu tự động.
+
+### Vòng 2 — Pitching online
+
+**Thời gian:** 24/6.
+
+Top 5 đội có thứ hạng cao nhất ở vòng Grand Finals sẽ trình bày mô hình và phương pháp của mình.
+
+## 4. Yêu cầu kỹ thuật và ràng buộc
+
+Các đội được phép dùng nhiều phương pháp khác nhau:
+
+* Reinforcement Learning.
+* Rule-based.
+* Hybrid rule-based + learning.
+* Search-based planning.
+* Các phương pháp học máy khác nếu phù hợp.
+
+Ràng buộc quan trọng:
+
+* **Không được sử dụng API gọi đến các mô hình bên ngoài trong quá trình thi đấu.**
+* Khuyến khích dùng PyTorch hoặc TensorFlow.
+* Agent cần ra quyết định nhanh trong môi trường nhiều agent, trạng thái lớn, có yếu tố đối kháng và nhiều chiến thuật khác nhau.
+
+Thông tin tổ chức:
+
+* Link đăng ký: https://forms.gle/E3N6JWXLBsZXhRP26
+* Thời gian mở đăng ký: 21/5.
+* Tổng giải thưởng: 1.500.000 đồng.
+* Kênh hỗ trợ / hướng dẫn: `#Tổng quan`.
+
+## 5. Môi trường game
+
+Game là một môi trường chiến thuật theo lượt trên bản đồ lưới.
+
+Trong tài liệu hướng dẫn, môi trường được mô tả là dạng Bomberland / Bomberman với:
+
+* 4 agent.
+* Bản đồ lưới **13 × 13**.
+* Mỗi agent chọn 1 hành động tại mỗi step.
+* Mỗi trận tối đa **500 steps**.
+* Mỗi step có giới hạn xử lý nghiêm ngặt, tài liệu có nhắc tới **100 ms/step** khi bàn về planning/search.
+
+Mục tiêu thực tế của agent không chỉ là tìm đường đi ngắn nhất, mà còn phải:
+
+* Dự đoán hành động đối thủ.
+* Tính toán vùng nguy hiểm do bom.
+* Tối ưu hóa việc phá hộp để lấy item.
+* Tìm đường thoát sau khi đặt bom.
+* Cân bằng giữa tấn công, phòng thủ, farming và sinh tồn.
+
+## 6. Thứ tự xử lý mỗi step
+
+Engine xử lý mỗi step theo thứ tự:
+
+1. Thu thập hành động từ các agent.
+2. Xử lý di chuyển.
+3. Đặt bom.
+4. Giảm timer bom.
+5. Giải quyết nổ.
+6. Loại agent.
+7. Spawn vật phẩm.
+8. Kiểm tra điều kiện kết thúc.
+
+Điều này rất quan trọng khi viết agent vì hành động ở step hiện tại có thể ảnh hưởng đến việc agent có kịp thoát khỏi bom hay không, bom có được đặt thành công hay không, item có được nhặt hay bị hủy hay không.
+
+## 7. Action space của agent
+
+Tại mỗi step, agent gửi về một số nguyên đại diện cho hành động:
+
+| Giá trị | Hành động  | Ý nghĩa                      |
+| ------: | ---------- | ---------------------------- |
+|       0 | STOP       | Đứng yên tại vị trí hiện tại |
+|       1 | LEFT       | Di chuyển sang trái 1 ô      |
+|       2 | RIGHT      | Di chuyển sang phải 1 ô      |
+|       3 | UP         | Di chuyển lên trên 1 ô       |
+|       4 | DOWN       | Di chuyển xuống dưới 1 ô     |
+|       5 | PLACE_BOMB | Đặt bom tại vị trí hiện tại  |
+
+## 8. Quy tắc di chuyển
+
+Agent không thể đi vào:
+
+* Ô có **Tường**, mã `1`.
+* Ô có **Hộp**, mã `2`.
+* Ô đã có bom từ các step trước.
+
+Ngoại lệ:
+
+* Nếu agent vừa đặt bom tại ô hiện tại trong cùng step đó, agent vẫn có thể di chuyển ra ngoài ở các step tiếp theo theo cơ chế game cho phép thoát khỏi ô vừa đặt bom.
+
+Quy tắc chồng vị trí:
+
+* Nhiều agent có thể đứng cùng một ô.
+* Nếu từ 2 agent trở lên cùng bước vào một ô có vật phẩm, vật phẩm bị hủy và không agent nào nhận được.
+
+## 9. Cơ chế bom
+
+### 9.1. Thông số mặc định
+
+Mỗi agent ban đầu có:
+
+* **Bomb timer:** 7 steps.
+* **Radius:** bắt đầu là 1, tối đa là 5.
+* **Bomb capacity:** bắt đầu là 1, tối đa là 5.
+
+Bom nổ khi timer giảm về **≤ 0**.
+
+### 9.2. Điều kiện đặt bom
+
+Agent chỉ đặt được bom nếu:
+
+* `bombs_left > 0`.
+* Ô hiện tại chưa có bom từ step trước.
+
+### 9.3. Xử lý nhiều agent đặt bom cùng một ô
+
+Nếu nhiều agent cùng đặt bom tại một ô:
+
+1. Ưu tiên bom có radius lớn hơn.
+2. Nếu radius bằng nhau, ưu tiên agent có ID nhỏ hơn.
+3. Chỉ agent có bom được giữ lại theo luật trên mới bị trừ `bombs_left`.
+
+### 9.4. Cơ chế nổ
+
+Bom nổ theo hình chữ thập, lan theo 4 hướng:
+
+* Trái.
+* Phải.
+* Lên.
+* Xuống.
+
+Vật cản:
+
+* Tường chặn hoàn toàn vụ nổ.
+* Hộp chặn vụ nổ và bị phá hủy.
+* Agent không chặn vụ nổ.
+
+Chain reaction:
+
+* Nếu vụ nổ chạm vào một quả bom khác, quả bom đó nổ ngay trong cùng step.
+
+## 10. Cơ chế vật phẩm
+
+Vật phẩm giúp tăng sức mạnh agent, gồm:
+
+* Item tăng **Radius**.
+* Item tăng **Capacity**.
+
+### 10.1. Rơi từ hộp bị phá
+
+Khi hộp bị phá:
+
+* 30% rơi item Radius.
+* 30% rơi item Capacity.
+* 40% không rơi gì.
+
+Tổng xác suất có item khi phá hộp là 60%.
+
+### 10.2. Auto-spawn
+
+Tại mỗi ô cỏ trống, xác suất xuất hiện vật phẩm mỗi step là:
+
+`P = 0.0003 × (step / 165)`
+
+Nếu item xuất hiện:
+
+* 50% là Radius.
+* 50% là Capacity.
+
+## 11. Điều kiện loại agent và kết thúc trận
+
+Agent bị loại ngay lập tức nếu đứng trong ô bị ảnh hưởng bởi vụ nổ, kể cả khi đó là bom do chính agent đặt.
+
+Agent đã bị loại vẫn để lại các quả bom cũ trên sân. Các bom này vẫn có thể nổ và gây ảnh hưởng sau đó.
+
+Trận đấu kết thúc khi:
+
+1. Chỉ còn ≤ 1 agent sống sót.
+2. Hoặc đạt giới hạn **500 steps**.
+
+Trong file thể lệ tổng quan, điều kiện được mô tả ở mức đội: trận kết thúc khi chỉ còn 1 đội duy nhất còn agent trên bản đồ hoặc hết thời gian quy định. Trong file hướng dẫn kỹ thuật, điều kiện được cụ thể hóa thành ≤ 1 agent sống sót hoặc 500 steps.
+
+## 12. Các yếu tố agent cần quan sát hoặc suy luận
+
+Tài liệu không đưa ra một schema observation chính thức, nhưng từ luật game, một agent hiệu quả nên xây dựng trạng thái nội bộ gồm:
+
+### Thông tin bản đồ
+
+* Kích thước map.
+* Vị trí tường.
+* Vị trí hộp.
+* Vị trí ô trống / cỏ.
+* Vị trí item Radius / Capacity.
+
+### Thông tin bản thân
+
+* Vị trí hiện tại.
+* Radius hiện tại.
+* Bomb capacity hiện tại.
+* `bombs_left`.
+* Trạng thái sống / chết.
+
+### Thông tin đối thủ
+
+* Vị trí các agent khác.
+* Agent nào còn sống.
+* Khoảng cách đến từng đối thủ.
+* Khả năng đối thủ đặt bom dựa trên vị trí và trạng thái bom.
+
+### Thông tin bom
+
+* Vị trí từng quả bom.
+* Timer còn lại.
+* Radius của bom.
+* Chủ sở hữu bom nếu có.
+* Vùng nổ dự kiến.
+* Chain reaction có thể xảy ra.
+
+### Feature chiến thuật nên tính
+
+* Danger map cho từng step tương lai.
+* Safe cells có thể đi tới trước khi bom nổ.
+* Khoảng cách đến item an toàn gần nhất.
+* Khoảng cách đến đối thủ gần nhất.
+* Số hộp có thể phá nếu đặt bom tại vị trí hiện tại.
+* Đường thoát sau khi đặt bom.
+* Các vị trí trap đối thủ.
+* Các ô có nguy cơ bị đối thủ đặt bom khóa đường.
+

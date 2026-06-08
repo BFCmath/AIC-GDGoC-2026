@@ -14,6 +14,59 @@ import random
 import argparse
 from pathlib import Path
 
+
+# ── BTC-accurate ranking helpers ──────────────────────────────────────────────
+
+def _tb_key(player_obj):
+    """Tie-break sort key (higher tuple = better rank). Uses engine Player object."""
+    s = player_obj.stats
+    return (s['kills'], s['boxes'], s['items'], s['bombs'])
+
+
+def compute_ranks(survivors, death_order, env):
+    """
+    Compute ranks[4] (lower = better) following BTC rules:
+      - 0 survivors  : rank by reversed death_order.
+      - 1 survivor   : rank 0; dead ranked by death_order.
+      - ≥2 survivors : tie-break by kills > boxes > items > bombs (desc);
+                        equal stats → same rank; dead ranked below survivors.
+    """
+    ranks = [None] * 4
+
+    if len(survivors) == 0:
+        current_rank = 0
+        for j in reversed(death_order):
+            ranks[j] = current_rank
+            current_rank += 1
+        return ranks
+
+    if len(survivors) == 1:
+        ranks[survivors[0]] = 0
+    else:
+        sorted_surv = sorted(
+            survivors,
+            key=lambda i: _tb_key(env.players[i]),
+            reverse=True,
+        )
+        rank_val = 0
+        for idx, pi in enumerate(sorted_surv):
+            if idx > 0:
+                prev = sorted_surv[idx - 1]
+                if _tb_key(env.players[pi]) < _tb_key(env.players[prev]):
+                    rank_val = idx
+            ranks[pi] = rank_val
+
+    # Dead players ranked below all survivors
+    num_surv_ranks = max(ranks[i] for i in survivors) + 1
+    current_rank = num_surv_ranks
+    for j in reversed(death_order):
+        ranks[j] = current_rank
+        current_rank += 1
+
+    return ranks
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 parent_dir = Path(__file__).resolve().parent.parent
 # Add parent directory to sys.path if not already present
 if str(parent_dir) not in sys.path:
@@ -107,16 +160,16 @@ def make_agents(agent_paths, seed=None):
 def run_match(agent_paths, num_episodes=10, max_steps=500, seed=None):
     env = BomberEnv(max_steps=max_steps, seed=seed)
     n_players = len(agent_paths)
-    
+
     agents, names = make_agents(agent_paths, seed)
-    info = [{"name": names[i], "wins": 0} for i in range(n_players)]
+    info = [{"name": names[i], "wins": 0, "draws": 0} for i in range(n_players)]
 
     for episode in range(num_episodes):
         episode_seed = None if seed is None else seed + episode
         obs = env.reset(seed=episode_seed)
         done = False
         step = 0
-        death_order = []
+        death_order = []          # player indices in order of death
         prev_alive = [bool(p[2]) for p in obs["players"]]
 
         while not done and step < max_steps:
@@ -128,7 +181,7 @@ def run_match(agent_paths, num_episodes=10, max_steps=500, seed=None):
                     print(f"Agent {names[i]} failed to act: {e}")
                     action = 0
                 actions.append(action)
-                
+
             obs, terminated, truncated = env.step(actions)
             done = terminated or truncated
             step += 1
@@ -136,22 +189,34 @@ def run_match(agent_paths, num_episodes=10, max_steps=500, seed=None):
             alive_now = [bool(p[2]) for p in obs["players"]]
             for i in range(n_players):
                 if prev_alive[i] and not alive_now[i]:
-                    death_order.append(info[i]["name"])
+                    death_order.append(i)   # track index, not name
             prev_alive = alive_now
-        
+
         alive_final = [bool(p[2]) for p in obs["players"]]
         survivors = [i for i in range(n_players) if alive_final[i]]
-        
-        if len(survivors) == 1:
-            winner = survivors[0]
-            info[winner]["wins"] += 1
-            print(f"Episode {episode + 1}: {info[winner]['name']} wins | Died: {death_order}")
+
+        # BTC-accurate ranking with tie-break
+        ranks = compute_ranks(survivors, death_order, env)
+        tb_applied = truncated and len(survivors) > 1
+        tb_note = " [tie-break]" if tb_applied else ""
+
+        winners = [i for i in range(n_players) if ranks[i] == 0]
+        died_names = [names[j] for j in death_order]
+
+        if len(winners) == 1:
+            w = winners[0]
+            info[w]["wins"] += 1
+            print(f"Episode {episode + 1}: {names[w]} wins{tb_note} | Died: {died_names}")
+        elif len(winners) > 1:
+            for w in winners:
+                info[w]["draws"] += 1
+            print(f"Episode {episode + 1}: Draw {[names[w] for w in winners]}{tb_note} | Died: {died_names}")
         else:
-            print(f"Episode {episode + 1}: Draw | Died: {death_order}")
+            print(f"Episode {episode + 1}: All dead | Died: {died_names}")
 
     print("\n=== Summary ===")
     for i in range(n_players):
-        print(f"{info[i]['name']}: {info[i]['wins']} wins")
+        print(f"{info[i]['name']}: {info[i]['wins']} wins, {info[i]['draws']} draws")
     return info
 
 if __name__ == "__main__":
