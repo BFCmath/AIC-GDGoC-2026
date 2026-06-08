@@ -51,3 +51,9 @@ def test_train_bc_ppo_script_has_cli_entrypoint():
     assert "def main(" in text
     assert "argparse.ArgumentParser" in text
     assert "if __name__ == \"__main__\":" in text
+
+
+def test_inline_ppo_batch_append_keeps_reward_and_value_order():
+    text = "\n".join(_sources())
+    assert "batch.append(*record, reward, done)" not in text
+    assert "batch.append(spatial, scalar, mask, action, logprob, reward, done, value)" in text
