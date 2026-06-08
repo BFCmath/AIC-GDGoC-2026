@@ -9,6 +9,9 @@
 | document-benchmark | Commit and push the benchmark documentation for the new agents | done | Documented and committed benchmark results |
 | benchmark-codex-6 | Benchmark Codex 6 and document its performance | done | Completed local tournament: Codex 6 got 5 wins, 0 draws |
 | benchmark-codex-7 | Benchmark Codex 7 and document its performance | done | Completed local tournament: Codex 7 got 5 wins, 0 draws |
+| clash-strong-agents | Run 4-way benchmark tournament among Claude 2, Codex 4, Codex 6, and Codex 7 | done | Completed clash tournament: Codex 7 wins 10/20, Codex 4 wins 6/20 |
+
+
 
 
 
