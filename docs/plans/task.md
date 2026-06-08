@@ -8,6 +8,9 @@
 | benchmark-new-agents | Benchmark the new agents and fix their runtime/loading bugs | done | Benchmarked all 5 agents; fixed bugs in deepseek 2, grok 1, and gemini 1 |
 | document-benchmark | Commit and push the benchmark documentation for the new agents | done | Documented and committed benchmark results |
 | benchmark-codex-6 | Benchmark Codex 6 and document its performance | done | Completed local tournament: Codex 6 got 5 wins, 0 draws |
+| benchmark-codex-7 | Benchmark Codex 7 and document its performance | done | Completed local tournament: Codex 7 got 5 wins, 0 draws |
+
+
 
 
 
