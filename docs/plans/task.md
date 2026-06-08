@@ -4,3 +4,4 @@
 | update-notebook | Update colab/base.ipynb to match training script changes and handle fallback file copying | done | Successfully synchronized notebook cells with train_bc_ppo.py |
 | run-verification | Run verification smoke test command | done | Smoke test passes; local match vs 4.py/Tactical/Genius gets 6/10 wins |
 | document-changes | Document changes in walkthrough.md | done | Walkthrough created in brain directory |
+| track-experts | Add agent/codex/3.py and agent/codex/4.py to git and push to origin | done | Pushed expert agents to remote |
