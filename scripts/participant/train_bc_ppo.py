@@ -58,6 +58,7 @@ MOVES = {
 }
 
 EXPERT_SPECS = [
+    "agent/codex/7.py",
     "agent/codex/4.py",
     "agent/codex/1.py",
     "agent/codex/2.py",
@@ -68,6 +69,7 @@ EXPERT_SPECS = [
 ]
 
 OPPONENT_SPECS = [
+    "agent/codex/7.py",
     "agent/codex/4.py",
     "agent/codex/1.py",
     "agent/codex/2.py",
@@ -77,6 +79,7 @@ OPPONENT_SPECS = [
     "BoxFarmerAgent",
     "SimpleRuleAgent",
 ]
+
 
 
 def seed_everything(seed: int) -> None:
@@ -496,10 +499,14 @@ def collect_expert_dataset(num_matches, max_steps, seed):
     for match in range(num_matches):
         specs = []
         for i in range(4):
-            if random.random() < 0.7:
+            r = random.random()
+            if r < 0.45:
+                specs.append("agent/codex/7.py")
+            elif r < 0.75:
                 specs.append("agent/codex/4.py")
             else:
                 specs.append(random.choice(EXPERT_SPECS))
+
         experts = [make_agent(specs[i], i) for i in range(4)]
         obs = env.reset(seed=seed + match)
         for step in range(max_steps):
@@ -656,40 +663,43 @@ def _get_safe_actions_mask(obs, aid):
     return mask
 
 
-def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, cur_stats=None):
+def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, cur_stats=None, stage=3):
     if prev_obs is None:
         return 0.0
     prev_p = prev_obs["players"][agent_id]
     cur_p = obs["players"][agent_id]
-    reward = 0.015 if int(prev_p[2]) == 1 else 0.0
     
-    # Death penalty
+    # Step reward: +0.03 survive one step
+    reward = 0.03 if int(prev_p[2]) == 1 else 0.0
+    
+    # Death penalty: -8.0
     if int(prev_p[2]) == 1 and int(cur_p[2]) == 0:
         reward -= 8.0
         prev_pos = (int(prev_p[0]), int(prev_p[1]))
+        # extra -0.8 if dead by own bomb
         if is_death_by_own_bomb(prev_obs, prev_pos, agent_id):
             reward -= 0.8
 
-    # Stats based rewards (kills and boxes)
     if prev_stats is not None and cur_stats is not None:
+        # kill opponent: +4.0
         kills_diff = cur_stats["kills"] - prev_stats["kills"]
         if kills_diff > 0:
-            reward += 1.0 * kills_diff
+            reward += 4.0 * kills_diff
             
+        # destroy box: +0.08
         boxes_diff = cur_stats["boxes"] - prev_stats["boxes"]
         if boxes_diff > 0:
-            if safe_bfs_action(obs, agent_id, horizon=8) is not None:
-                reward += 0.15 * boxes_diff
+            reward += 0.08 * boxes_diff
 
-    # Item collection rewards
+    # collect item: +0.15
     capacity_diff = int(cur_p[3]) - int(prev_p[3])
     radius_diff = int(cur_p[4]) - int(prev_p[4])
     if capacity_diff > 0:
-        reward += 0.25 * capacity_diff
+        reward += 0.15 * capacity_diff
     if radius_diff > 0:
-        reward += 0.20 * radius_diff
+        reward += 0.15 * radius_diff
 
-    # Safe escape from danger
+    # leave danger: +0.30
     prev_pos = (int(prev_p[0]), int(prev_p[1]))
     cur_pos = (int(cur_p[0]), int(cur_p[1]))
     prev_danger = danger_schedule(prev_obs["map"], prev_obs["bombs"], prev_obs["players"], horizon=3)
@@ -700,30 +710,53 @@ def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, c
     
     if in_prev_danger and not in_cur_danger:
         reward += 0.3
-
-    # Penalty for standing in future blast
+        
+    # enter unavoidable danger: -0.70
+    if not in_prev_danger and in_cur_danger:
+        reward -= 0.70
+        
+    # standing in future danger (minor penalty for step-to-step danger overlap)
     if cur_pos in cur_danger.get(1, set()) or cur_pos in cur_danger.get(2, set()):
         reward -= 0.2
 
-    # Penalty for placing bomb without escape
-    if action == 5 and not can_escape_after_bomb(prev_obs, agent_id):
-        reward -= 1.0
+    # place bomb value:
+    # +0.25 place bomb that hits box and has escape path
+    # +0.80 place bomb that traps/threatens enemy and has escape path
+    # -1.50 place bomb with no escape
+    if action == 5:
+        has_escape = can_escape_after_bomb(prev_obs, agent_id)
+        if not has_escape:
+            reward -= 1.50
+        else:
+            bx, by = prev_pos
+            radius = 1 + int(prev_p[4])
+            boxes = boxes_hit_if_bomb(prev_obs["map"], prev_pos, radius)
+            enemies = enemies_hit_if_bomb(prev_obs["map"], prev_obs["players"], agent_id, prev_pos, radius)
+            if enemies > 0:
+                reward += 0.80
+            elif boxes > 0:
+                reward += 0.25
+                
+    # useless STOP when safe: -0.02
+    if action == 0 and not in_prev_danger:
+        reward -= 0.02
 
     # Terminal rank rewards
     if done:
         ranks = rank_players(env)
-        ranks_reward = {0: 2.0, 1: 0.2, 2: -0.6, 3: -1.2}
+        ranks_reward = {0: 10.0, 1: 1.0, 2: -2.0, 3: -6.0}
         rank_val = ranks[agent_id]
         if rank_val == 0:
             winners = [i for i in range(4) if ranks[i] == 0]
             if len(winners) > 1:
-                reward += 0.7
+                reward += 3.0
             else:
-                reward += 2.0
+                reward += 10.0
         else:
-            reward += ranks_reward.get(rank_val, -1.2)
+            reward += ranks_reward.get(rank_val, -6.0)
             
     return float(reward)
+
 
 
 @dataclass
@@ -792,35 +825,71 @@ class NeuralSafeAgent:
         return int(action.item())
 
 
-def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_models=None):
+def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_models=None, stage=3):
     batch = PPOBatch.empty()
     model.eval()
     snapshot_models = snapshot_models or []
     
+    # Override max_steps based on Curriculum Stage
+    if stage == 1:
+        stage_max_steps = 150
+    elif stage == 2:
+        stage_max_steps = 300
+    else:
+        stage_max_steps = max_steps
+        
     for env_idx in range(envs):
         control_id = random.randrange(4)
-        env = BomberEnv(max_steps=max_steps, seed=seed + env_idx)
+        env = BomberEnv(max_steps=stage_max_steps, seed=seed + env_idx)
         obs = env.reset(seed=seed + env_idx)
         
-        # Build self-play/opponent pool
+        # Build self-play/opponent pool based on stage
         agents = []
         for i in range(4):
             if i == control_id:
-                agents.append(NeuralSafeAgent(i, model, device, fallback_agent=make_agent("agent/codex/4.py", i)))
+                agents.append(NeuralSafeAgent(i, model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
             else:
-                r = random.random()
-                if r < 0.30:
-                    agents.append(make_agent("agent/codex/4.py", i))
-                elif r < 0.50:
-                    agents.append(make_agent(random.choice(["agent/codex/1.py", "agent/codex/2.py"]), i))
-                elif r < 0.70:
-                    agents.append(make_agent(random.choice(["TacticalRuleAgent", "GeniusRuleAgent", "SmarterRuleAgent"]), i))
-                elif r < 0.90 and snapshot_models:
-                    snap_model = random.choice(snapshot_models)
-                    agents.append(NeuralSafeAgent(i, snap_model, device, fallback_agent=make_agent("agent/codex/4.py", i)))
-                else:
-                    agents.append(make_agent(random.choice(["RandomAgent", "SimpleRuleAgent", "BoxFarmerAgent"]), i))
-                    
+                if stage == 1:
+                    # Stage 1: mostly random/weak/noisy (70%) and Codex 4/7 (30%)
+                    r = random.random()
+                    if r < 0.70:
+                        agents.append(make_agent(random.choice(["RandomAgent", "SimpleRuleAgent", "BoxFarmerAgent"]), i))
+                    else:
+                        agents.append(make_agent(random.choice(["agent/codex/4.py", "agent/codex/7.py"]), i))
+                elif stage == 2:
+                    # Stage 2: mostly rule-based (60%) and Codex 4/7 (40%)
+                    r = random.random()
+                    if r < 0.60:
+                        agents.append(make_agent(random.choice(["TacticalRuleAgent", "GeniusRuleAgent", "SmarterRuleAgent"]), i))
+                    else:
+                        agents.append(make_agent(random.choice(["agent/codex/4.py", "agent/codex/7.py"]), i))
+                elif stage == 3:
+                    # Stage 3: 30% top local, 25% snapshots, 20% rule, 15% weak, 10% current
+                    r = random.random()
+                    if r < 0.30:
+                        agents.append(make_agent(random.choice(["agent/codex/7.py", "agent/codex/4.py"]), i))
+                    elif r < 0.55:
+                        if snapshot_models:
+                            snap_model = random.choice(snapshot_models)
+                            agents.append(NeuralSafeAgent(i, snap_model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
+                        else:
+                            agents.append(make_agent("agent/codex/7.py", i))
+                    elif r < 0.75:
+                        agents.append(make_agent(random.choice(["TacticalRuleAgent", "GeniusRuleAgent", "SmarterRuleAgent"]), i))
+                    elif r < 0.90:
+                        agents.append(make_agent(random.choice(["RandomAgent", "SimpleRuleAgent", "BoxFarmerAgent"]), i))
+                    else:
+                        agents.append(NeuralSafeAgent(i, model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
+                else: # Stage 4: only top snapshots, Codex 7, and Codex 4
+                    r = random.random()
+                    if r < 0.40:
+                        agents.append(make_agent(random.choice(["agent/codex/7.py", "agent/codex/4.py"]), i))
+                    elif r < 0.80 and snapshot_models:
+                        snap_model = random.choice(snapshot_models)
+                        agents.append(NeuralSafeAgent(i, snap_model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
+                    else:
+                        agents.append(NeuralSafeAgent(i, model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
+                        
         prev_obs = None
         prev_stats = None
         for step in range(horizon):
@@ -829,7 +898,7 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             for i, agent in enumerate(agents):
                 if i == control_id:
                     forced = forced_safety_action(obs, i)
-                    spatial, scalar = encode_observation(obs, i, step, max_steps=max_steps)
+                    spatial, scalar = encode_observation(obs, i, step, max_steps=stage_max_steps)
                     mask = _get_safe_actions_mask(obs, i)
                     with torch.no_grad():
                         action_t, logprob_t, _, value_t = sample_masked_action(
@@ -854,7 +923,7 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             if env.players[control_id] is not None:
                 cur_stats = env.players[control_id].stats.copy()
                 
-            reward = shaped_reward(prev_obs, next_obs, env, control_id, actions[control_id], done, prev_stats, cur_stats)
+            reward = shaped_reward(prev_obs, next_obs, env, control_id, actions[control_id], done, prev_stats, cur_stats, stage=stage)
             
             if record is not None:
                 spatial, scalar, mask, action, logprob, value = record
@@ -898,6 +967,18 @@ def train_ppo(model, device, args):
     snapshot_models.append(initial_snap)
     
     for update in range(args.ppo_updates):
+        # Determine curriculum stage (1 to 4)
+        progress = float(update) / float(args.ppo_updates)
+        if progress < 0.25:
+            stage = 1
+        elif progress < 0.50:
+            stage = 2
+        elif progress < 0.75:
+            stage = 3
+        else:
+            stage = 4
+
+        print(f"PPO Update {update + 1}/{args.ppo_updates} | Curriculum Stage {stage}")
         batch = collect_ppo_rollout(
             model,
             device=device,
@@ -906,10 +987,12 @@ def train_ppo(model, device, args):
             max_steps=args.max_steps,
             seed=args.seed + 10000 * update,
             snapshot_models=snapshot_models,
+            stage=stage,
         )
         if not batch.actions:
             print(f"PPO {update + 1}/{args.ppo_updates}: empty rollout")
             continue
+
         advantages, returns = compute_gae(batch.rewards, batch.dones, batch.values, args.gamma, args.gae_lambda)
         spatial = torch.from_numpy(np.asarray(batch.spatial, dtype=np.float32)).to(device)
         scalar = torch.from_numpy(np.asarray(batch.scalar, dtype=np.float32)).to(device)
@@ -1177,7 +1260,9 @@ class Agent:
         self.fallback_agent = None
         try:
             import importlib.util
-            fallback_path = Path(__file__).parent / "4.py"
+            fallback_path = Path(__file__).parent / "7.py"
+            if not fallback_path.exists():
+                fallback_path = Path(__file__).parent / "4.py"
             if fallback_path.exists():
                 spec = importlib.util.spec_from_file_location("fallback_teacher", fallback_path)
                 module = importlib.util.module_from_spec(spec)
@@ -1185,6 +1270,7 @@ class Agent:
                 self.fallback_agent = module.Agent(self.agent_id)
         except Exception:
             pass
+
 
     def act(self, obs):
         try:
@@ -1243,6 +1329,15 @@ def export_agent(model, export_dir):
         print(f"Copied 4.py as fallback teacher to {export_path}")
     except Exception as e:
         print(f"Warning: Failed to copy 4.py: {e}")
+        
+    # Copy 7.py as fallback teacher
+    try:
+        import shutil
+        shutil.copy(ROOT / "agent/codex/7.py", export_path / "7.py")
+        print(f"Copied 7.py as fallback teacher to {export_path}")
+    except Exception as e:
+        print(f"Warning: Failed to copy 7.py: {e}")
+
         
     print(f"Exported to {export_path}")
     return export_path
