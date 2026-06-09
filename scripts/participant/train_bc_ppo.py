@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import random
 import sys
 import time
@@ -721,14 +722,11 @@ def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, c
         boxes_diff = cur_stats["boxes"] - prev_stats["boxes"]
         if boxes_diff > 0:
             reward += 0.5 * boxes_diff
-
-    # collect item: +1.0
-    capacity_diff = int(cur_p[3]) - int(prev_p[3])
-    radius_diff = int(cur_p[4]) - int(prev_p[4])
-    if capacity_diff > 0:
-        reward += 1.0 * capacity_diff
-    if radius_diff > 0:
-        reward += 1.0 * radius_diff
+            
+        # collect item: +1.0
+        items_diff = cur_stats["items"] - prev_stats["items"]
+        if items_diff > 0:
+            reward += 1.0 * items_diff
 
     # leave danger: +0.30
     prev_pos = (int(prev_p[0]), int(prev_p[1]))
@@ -826,17 +824,21 @@ class PPOBatch:
 
 
 class NeuralSafeAgent:
-    def __init__(self, agent_id, model, device, deterministic=False, fallback_agent=None):
+    def __init__(self, agent_id, model, device, deterministic=False, fallback_agent=None, use_mask=True):
         self.agent_id = int(agent_id)
         self.model = model
         self.device = device
         self.deterministic = deterministic
         self.step_count = 0
         self.fallback_agent = fallback_agent
+        self.use_mask = use_mask
+        self.fallback_count = 0
+        self.total_steps = 0
 
     def act(self, obs):
+        self.total_steps += 1
         forced = forced_safety_action(obs, self.agent_id)
-        if forced is not None:
+        if forced is not None and self.use_mask:
             return int(forced)
             
         mask = _get_safe_actions_mask(obs, self.agent_id)
@@ -850,27 +852,35 @@ class NeuralSafeAgent:
             logits, _ = self.model(s, a)
             probs = torch.softmax(logits, dim=-1)
             
-            masked_log = masked_logits(logits, m)
-            dist = torch.distributions.Categorical(logits=masked_log)
-            action = torch.argmax(masked_log, dim=-1) if self.deterministic else dist.sample()
+            if self.use_mask:
+                masked_log = masked_logits(logits, m)
+                dist = torch.distributions.Categorical(logits=masked_log)
+                action = torch.argmax(masked_log, dim=-1) if self.deterministic else dist.sample()
+            else:
+                dist = torch.distributions.Categorical(logits=logits)
+                action = torch.argmax(logits, dim=-1) if self.deterministic else dist.sample()
             
             prob = probs[0, action].item()
-            if (prob < 0.25 or not mask[action]) and self.fallback_agent is not None:
-                try:
-                    return int(self.fallback_agent.act(obs))
-                except Exception:
-                    pass
-                    
+            if self.fallback_agent is not None:
+                if prob < 0.25 or (self.use_mask and not mask[action]):
+                    try:
+                        fallback_action = int(self.fallback_agent.act(obs))
+                        self.fallback_count += 1
+                        return fallback_action
+                    except Exception:
+                        pass
+                        
         self.step_count += 1
         return int(action.item())
 
 
 def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_models=None, stage=0):
-    batch = PPOBatch.empty()
+    trajectories = []
     model.eval()
     snapshot_models = snapshot_models or []
     
     for env_idx in range(envs):
+        batch = PPOBatch.empty()
         control_id = random.randrange(4)
         env = BomberEnv(max_steps=max_steps, seed=seed + env_idx)
         obs = env.reset(seed=seed + env_idx)
@@ -898,8 +908,6 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
                 else: # Stage 7
                     agents.append(make_agent(random.choice(["agent/codex/7.py", "agent/codex/4.py", "agent/codex/8.py"]), i))
                         
-        prev_obs = None
-        prev_stats = None
         death_steps = {}
         prev_alive = {i: True for i in range(4)}
         prev_visited_positions = deque(maxlen=4)
@@ -910,17 +918,21 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             for i, agent in enumerate(agents):
                 if i == control_id:
                     forced = forced_safety_action(obs, i)
-                    spatial, scalar = encode_observation(obs, i, step, max_steps=max_steps)
-                    mask = _get_safe_actions_mask(obs, i)
-                    with torch.no_grad():
-                        action_t, logprob_t, _, value_t = sample_masked_action(
-                            model,
-                            torch.from_numpy(spatial).unsqueeze(0).to(device),
-                            torch.from_numpy(scalar).unsqueeze(0).to(device),
-                            torch.from_numpy(mask).unsqueeze(0).to(device),
-                        )
-                    action = int(forced) if forced is not None else int(action_t.item())
-                    record = (spatial, scalar, mask, action, float(logprob_t.item()), float(value_t.item()))
+                    if forced is not None:
+                        action = int(forced)
+                        record = None
+                    else:
+                        spatial, scalar = encode_observation(obs, i, step, max_steps=max_steps)
+                        mask = _get_safe_actions_mask(obs, i)
+                        with torch.no_grad():
+                            action_t, logprob_t, _, value_t = sample_masked_action(
+                                model,
+                                torch.from_numpy(spatial).unsqueeze(0).to(device),
+                                torch.from_numpy(scalar).unsqueeze(0).to(device),
+                                torch.from_numpy(mask).unsqueeze(0).to(device),
+                            )
+                        action = int(action_t.item())
+                        record = (spatial, scalar, mask, action, float(logprob_t.item()), float(value_t.item()))
                 else:
                     try:
                         action = int(agent.act(obs))
@@ -928,6 +940,11 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
                         action = 0
                 actions.append(action if 0 <= action < ACTIONS else 0)
                 
+            prev_stats = None
+            if env.players[control_id] is not None:
+                prev_stats = env.players[control_id].stats.copy()
+            prev_obs_for_reward = obs
+
             next_obs, terminated, truncated = env.step(actions)
             done = bool(terminated or truncated)
             
@@ -941,7 +958,7 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             if env.players[control_id] is not None:
                 cur_stats = env.players[control_id].stats.copy()
                 
-            reward = shaped_reward(prev_obs, next_obs, env, control_id, actions[control_id], done, prev_stats, cur_stats, stage=stage, prev_visited_positions=prev_visited_positions, death_steps=death_steps)
+            reward = shaped_reward(prev_obs_for_reward, next_obs, env, control_id, actions[control_id], done, prev_stats, cur_stats, stage=stage, prev_visited_positions=prev_visited_positions, death_steps=death_steps)
             
             if env.players[control_id] is not None and getattr(env.players[control_id], "alive", False):
                 prev_visited_positions.append((int(env.players[control_id].x), int(env.players[control_id].y)))
@@ -950,13 +967,13 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
                 spatial, scalar, mask, action, logprob, value = record
                 batch.append(spatial, scalar, mask, action, logprob, reward, done, value)
                 
-            prev_obs = obs
             obs = next_obs
-            prev_stats = cur_stats
             
             if done:
                 break
-    return batch
+        if batch.actions:
+            trajectories.append(batch)
+    return trajectories
 
 
 def compute_gae(rewards, dones, values, gamma, gae_lambda):
@@ -973,19 +990,29 @@ def compute_gae(rewards, dones, values, gamma, gae_lambda):
         advantages[tick] = last_gae
         next_value = values[tick]
     returns = advantages + values
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     return advantages.astype(np.float32), returns.astype(np.float32)
 
 
-def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20):
+def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20, agent_type="fallback"):
     wins = 0
+    total_fallback = 0
+    total_steps = 0
     model.eval()
     for match in range(num_matches):
         env = BomberEnv(max_steps=max_steps, seed=1000000 + stage * 1000 + match)
         obs = env.reset(seed=1000000 + stage * 1000 + match)
         
         agents = []
-        agents.append(NeuralSafeAgent(0, model, device, deterministic=True, fallback_agent=make_agent("agent/codex/7.py", 0)))
+        if agent_type == "neural":
+            agent = NeuralSafeAgent(0, model, device, deterministic=True, fallback_agent=None, use_mask=False)
+        elif agent_type == "mask":
+            agent = NeuralSafeAgent(0, model, device, deterministic=True, fallback_agent=None, use_mask=True)
+        elif agent_type == "codex7":
+            agent = make_agent("agent/codex/7.py", 0)
+        else: # "fallback"
+            agent = NeuralSafeAgent(0, model, device, deterministic=True, fallback_agent=make_agent("agent/codex/7.py", 0), use_mask=True)
+            
+        agents.append(agent)
         
         if stage == 0:
             opps = ["RandomAgent", "SimpleRuleAgent"]
@@ -1025,12 +1052,21 @@ def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20):
                     prev_alive[i] = False
             if terminated or truncated:
                 break
+                
+        if hasattr(agents[0], "fallback_count"):
+            total_fallback += agents[0].fallback_count
+            total_steps += agents[0].total_steps
+        else:
+            total_steps += step + 1
+            
         ranks = rank_players(env, death_steps=death_steps)
         if ranks[0] == 0:
             winners = [i for i in range(4) if ranks[i] == 0]
             if len(winners) == 1:
                 wins += 1
-    return float(wins) / num_matches
+                
+    fallback_rate = total_fallback / max(1, total_steps)
+    return float(wins) / num_matches, fallback_rate
 
 CURRICULUM_CONFIG = {
     0: {"max_steps": 150, "win_rate": 0.80},
@@ -1063,16 +1099,29 @@ def train_ppo(model, device, args):
         # Evaluate and potentially advance stage
         if update > 0 and update % eval_interval == 0 and stage < 7:
             print(f"--- Evaluating Stage {stage} ---")
-            win_rate = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10)
-            print(f"Win Rate: {win_rate*100:.1f}% (Threshold: {stage_threshold*100:.1f}%)")
-            if win_rate >= stage_threshold:
+            
+            win_rate_codex, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="codex7")
+            print(f"Codex 7         : Win Rate: {win_rate_codex*100:.1f}%")
+            
+            win_rate_neural, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="neural")
+            print(f"Neural Only     : Win Rate: {win_rate_neural*100:.1f}%")
+            
+            win_rate_mask, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="mask")
+            print(f"Neural + Mask   : Win Rate: {win_rate_mask*100:.1f}%")
+            
+            win_rate_fallback, fallback_rate = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="fallback")
+            print(f"Neural+Mask+Fall: Win Rate: {win_rate_fallback*100:.1f}%, Fallback Rate: {fallback_rate*100:.1f}%")
+            
+            print(f"(Threshold: {stage_threshold*100:.1f}%)")
+            
+            if (win_rate_mask >= stage_threshold or win_rate_fallback >= stage_threshold) and (win_rate_mask > win_rate_codex or win_rate_fallback > win_rate_codex):
                 stage += 1
                 print(f"-> ADVANCED TO STAGE {stage}!")
             else:
                 print("-> Retrying stage...")
 
         print(f"PPO Update {update + 1}/{args.ppo_updates} | Curriculum Stage {stage}")
-        batch = collect_ppo_rollout(
+        trajectories = collect_ppo_rollout(
             model,
             device=device,
             horizon=args.ppo_horizon,
@@ -1082,16 +1131,37 @@ def train_ppo(model, device, args):
             snapshot_models=snapshot_models,
             stage=stage,
         )
-        if not batch.actions:
+        if not trajectories:
             print(f"PPO {update + 1}/{args.ppo_updates}: empty rollout")
             continue
 
-        advantages, returns = compute_gae(batch.rewards, batch.dones, batch.values, args.gamma, args.gae_lambda)
-        spatial = torch.from_numpy(np.asarray(batch.spatial, dtype=np.float32)).to(device)
-        scalar = torch.from_numpy(np.asarray(batch.scalar, dtype=np.float32)).to(device)
-        masks = torch.from_numpy(np.asarray(batch.masks, dtype=np.bool_)).to(device)
-        actions = torch.tensor(batch.actions, dtype=torch.long, device=device)
-        old_logprobs = torch.tensor(batch.logprobs, dtype=torch.float32, device=device)
+        all_advantages = []
+        all_returns = []
+        flat_batch = PPOBatch.empty()
+        
+        for traj in trajectories:
+            adv, ret = compute_gae(traj.rewards, traj.dones, traj.values, args.gamma, args.gae_lambda)
+            all_advantages.append(adv)
+            all_returns.append(ret)
+            
+            flat_batch.spatial.extend(traj.spatial)
+            flat_batch.scalar.extend(traj.scalar)
+            flat_batch.masks.extend(traj.masks)
+            flat_batch.actions.extend(traj.actions)
+            flat_batch.logprobs.extend(traj.logprobs)
+            flat_batch.rewards.extend(traj.rewards)
+            flat_batch.dones.extend(traj.dones)
+            flat_batch.values.extend(traj.values)
+
+        advantages = np.concatenate(all_advantages)
+        returns = np.concatenate(all_returns)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        spatial = torch.from_numpy(np.asarray(flat_batch.spatial, dtype=np.float32)).to(device)
+        scalar = torch.from_numpy(np.asarray(flat_batch.scalar, dtype=np.float32)).to(device)
+        masks = torch.from_numpy(np.asarray(flat_batch.masks, dtype=np.bool_)).to(device)
+        actions = torch.tensor(flat_batch.actions, dtype=torch.long, device=device)
+        old_logprobs = torch.tensor(flat_batch.logprobs, dtype=torch.float32, device=device)
         advantages_t = torch.from_numpy(advantages).to(device)
         returns_t = torch.from_numpy(returns).to(device)
         indices = np.arange(len(actions))
@@ -1113,7 +1183,7 @@ def train_ppo(model, device, args):
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 opt.step()
-        print(f"PPO {update + 1}/{args.ppo_updates}: reward_mean={np.mean(batch.rewards):.3f}, samples={len(actions)}")
+        print(f"PPO {update + 1}/{args.ppo_updates}: reward_mean={np.mean(flat_batch.rewards):.3f}, samples={len(actions)}")
         
         # Save snapshot
         if (update + 1) % 10 == 0:
@@ -1481,6 +1551,7 @@ def build_arg_parser():
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--ent-coef", type=float, default=0.015)
     parser.add_argument("--grad-clip", type=float, default=0.5)
+    parser.add_argument("--curriculum-config", type=str, default="", help="Path to JSON file overriding CURRICULUM_CONFIG")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--save-checkpoint", default="checkpoints/hybrid_bc_ppo.pt")
     parser.add_argument("--export-dir", default="exports/hybrid_ppo_agent")
@@ -1490,6 +1561,15 @@ def build_arg_parser():
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+    
+    if args.curriculum_config:
+        global CURRICULUM_CONFIG
+        with open(args.curriculum_config, "r") as f:
+            data = json.load(f)
+        CURRICULUM_CONFIG.clear()
+        CURRICULUM_CONFIG.update({int(k): v for k, v in data.items()})
+        print(f"Loaded curriculum config from {args.curriculum_config}")
+        
     seed_everything(args.seed)
     device = torch.device(args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     print("Device:", device)
