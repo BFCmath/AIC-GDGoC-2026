@@ -902,6 +902,8 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
                         
         prev_obs = None
         prev_stats = None
+        prev_visited_positions = deque(maxlen=4)
+        
         for step in range(horizon):
             actions = []
             record = None
@@ -933,8 +935,11 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             if env.players[control_id] is not None:
                 cur_stats = env.players[control_id].stats.copy()
                 
-            reward = shaped_reward(prev_obs, next_obs, env, control_id, actions[control_id], done, prev_stats, cur_stats, stage=stage)
+            reward = shaped_reward(prev_obs, next_obs, env, control_id, actions[control_id], done, prev_stats, cur_stats, stage=stage, prev_visited_positions=prev_visited_positions)
             
+            if env.players[control_id] is not None and getattr(env.players[control_id], "alive", False):
+                prev_visited_positions.append((int(env.players[control_id].x), int(env.players[control_id].y)))
+                
             if record is not None:
                 spatial, scalar, mask, action, logprob, value = record
                 batch.append(spatial, scalar, mask, action, logprob, reward, done, value)
