@@ -835,22 +835,14 @@ class NeuralSafeAgent:
         return int(action.item())
 
 
-def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_models=None, stage=3):
+def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_models=None, stage=0):
     batch = PPOBatch.empty()
     model.eval()
     snapshot_models = snapshot_models or []
     
-    # Override max_steps based on Curriculum Stage
-    if stage == 1:
-        stage_max_steps = 150
-    elif stage == 2:
-        stage_max_steps = 300
-    else:
-        stage_max_steps = max_steps
-        
     for env_idx in range(envs):
         control_id = random.randrange(4)
-        env = BomberEnv(max_steps=stage_max_steps, seed=seed + env_idx)
+        env = BomberEnv(max_steps=max_steps, seed=seed + env_idx)
         obs = env.reset(seed=seed + env_idx)
         
         # Build self-play/opponent pool based on stage
@@ -886,7 +878,7 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             for i, agent in enumerate(agents):
                 if i == control_id:
                     forced = forced_safety_action(obs, i)
-                    spatial, scalar = encode_observation(obs, i, step, max_steps=stage_max_steps)
+                    spatial, scalar = encode_observation(obs, i, step, max_steps=max_steps)
                     mask = _get_safe_actions_mask(obs, i)
                     with torch.no_grad():
                         action_t, logprob_t, _, value_t = sample_masked_action(
@@ -995,6 +987,17 @@ def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20):
                 wins += 1
     return float(wins) / num_matches
 
+CURRICULUM_CONFIG = {
+    0: {"max_steps": 100, "win_rate": 0.80},
+    1: {"max_steps": 150, "win_rate": 0.70},
+    2: {"max_steps": 200, "win_rate": 0.60},
+    3: {"max_steps": 250, "win_rate": 0.50},
+    4: {"max_steps": 300, "win_rate": 0.40},
+    5: {"max_steps": 350, "win_rate": 0.40},
+    6: {"max_steps": 400, "win_rate": 0.40},
+    7: {"max_steps": 500, "win_rate": 0.35},
+}
+
 def train_ppo(model, device, args):
     opt = torch.optim.AdamW(model.parameters(), lr=args.ppo_lr, weight_decay=1e-4)
     snapshot_models = []
@@ -1008,13 +1011,16 @@ def train_ppo(model, device, args):
     eval_interval = 5
     
     for update in range(args.ppo_updates):
+        stage_cfg = CURRICULUM_CONFIG.get(stage, {"max_steps": args.max_steps, "win_rate": 0.40})
+        stage_max_steps = stage_cfg["max_steps"]
+        stage_threshold = stage_cfg["win_rate"]
         
         # Evaluate and potentially advance stage
         if update > 0 and update % eval_interval == 0 and stage < 7:
             print(f"--- Evaluating Stage {stage} ---")
-            win_rate = evaluate_agent_win_rate(model, device, stage, args.max_steps, num_matches=10)
-            print(f"Win Rate: {win_rate*100:.1f}% (Threshold: 40.0%)")
-            if win_rate >= 0.40:
+            win_rate = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10)
+            print(f"Win Rate: {win_rate*100:.1f}% (Threshold: {stage_threshold*100:.1f}%)")
+            if win_rate >= stage_threshold:
                 stage += 1
                 print(f"-> ADVANCED TO STAGE {stage}!")
             else:
@@ -1026,7 +1032,7 @@ def train_ppo(model, device, args):
             device=device,
             horizon=args.ppo_horizon,
             envs=args.ppo_envs_per_update,
-            max_steps=args.max_steps,
+            max_steps=stage_max_steps,
             seed=args.seed + 10000 * update,
             snapshot_models=snapshot_models,
             stage=stage,

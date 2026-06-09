@@ -18,8 +18,8 @@
 | clash-ppo2-7-4-claude2 | Run 4-way clash: Hybrid PPO Agent 2, Codex 7, Codex 4, Claude 2 | done | Completed |
 | anti-cowardice-reward | Task 1: Update Reward Shaping to Dynamic Anti-Cowardice Mode | done | Implemented dynamic reward shaping based on 8-stage curriculum |
 | wiggle-tracker | Task 2: Implement WiggleTracker in the Environment Runner | done | Added prev_visited_positions logic to prevent wiggling
-| win-rate-evaluator | Task 3: Implement Objective Win-Rate Evaluator & 8-Stage Curriculum | not_started |  |
-| bc-initialization | Task 4: Update BC Initialization | not_started |  |
+| win-rate-evaluator | Task 3: Implement Objective Win-Rate Evaluator & 8-Stage Curriculum | done | Added evaluate_agent_win_rate logic and stage advancement based on win rate |
+| bc-initialization | Task 4: Update BC Initialization | done | Verified config and synced colab notebook |
 
 
 
