@@ -1272,10 +1272,37 @@ def train_ppo(model, device, args):
     
     win_counters = defaultdict(lambda: {"wins": 0, "total": 0})
     
+    def run_eval(pct_label, update_label, force_milestones=False):
+        nonlocal best_eval_score
+        print(f"--- Evaluation at {pct_label*100:.1f}% (update {update_label}/{total_updates}) ---")
+        wr_codex, _ = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="codex7")
+        print(f"Codex 7         : Win Rate: {wr_codex*100:.1f}%")
+        wr_neural, _ = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="neural")
+        print(f"Neural Only     : Win Rate: {wr_neural*100:.1f}%")
+        wr_mask, _ = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="mask")
+        print(f"Neural + Mask   : Win Rate: {wr_mask*100:.1f}%")
+        wr_fallback, fallback_rate = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="fallback")
+        print(f"Neural+Mask+Fall: Win Rate: {wr_fallback*100:.1f}%, Fallback Rate: {fallback_rate*100:.1f}%")
+
+        eval_score = max(wr_mask, wr_fallback) - 0.25 * fallback_rate
+        if eval_score > best_eval_score:
+            best_eval_score = eval_score
+            Path(args.best_checkpoint).parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"model_state_dict": model.state_dict(), "pct": pct_label, "update": update_label, "eval_score": eval_score}, args.best_checkpoint)
+            print(f"-> Saved best checkpoint (score={eval_score:.3f})")
+
+        for mp in milestone_pcts:
+            if (mp not in saved_milestones and pct_label >= mp - 0.005) or (force_milestones and mp not in saved_milestones and pct_label >= mp):
+                saved_milestones.add(mp)
+                ms_name = f"milestone_{mp*100:.0f}pct"
+                ms_path = milestone_dir / f"{ms_name}_update{update_label}.pt"
+                torch.save({"model_state_dict": model.state_dict(), "pct": pct_label, "update": update_label, "eval_score": eval_score}, ms_path)
+                print(f"-> Saved milestone: {ms_path}")
+
     for update in range(args.ppo_updates):
         pct = update / total_updates
         
-        # Scheduled hyperparameters
+        # Scheduled hyperparameters (based on progress BEFORE this update)
         current_lr = lr_start + (lr_end - lr_start) * pct
         current_ent = ent_start + (ent_end - ent_start) * pct
         current_horizon = max(1, int(round(horizon_start + (horizon_end - horizon_start) * pct)))
@@ -1283,38 +1310,7 @@ def train_ppo(model, device, args):
         for pg in opt.param_groups:
             pg["lr"] = current_lr
         
-        # Evaluation and milestone checkpoints
-        if update > 0 and update % eval_interval == 0:
-            print(f"--- Evaluation at {pct*100:.1f}% (update {update}/{total_updates}) ---")
-            
-            wr_codex, _ = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="codex7")
-            print(f"Codex 7         : Win Rate: {wr_codex*100:.1f}%")
-            
-            wr_neural, _ = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="neural")
-            print(f"Neural Only     : Win Rate: {wr_neural*100:.1f}%")
-            
-            wr_mask, _ = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="mask")
-            print(f"Neural + Mask   : Win Rate: {wr_mask*100:.1f}%")
-            
-            wr_fallback, fallback_rate = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="fallback")
-            print(f"Neural+Mask+Fall: Win Rate: {wr_fallback*100:.1f}%, Fallback Rate: {fallback_rate*100:.1f}%")
-            
-            eval_score = max(wr_mask, wr_fallback) - 0.25 * fallback_rate
-            if eval_score > best_eval_score:
-                best_eval_score = eval_score
-                Path(args.best_checkpoint).parent.mkdir(parents=True, exist_ok=True)
-                torch.save({"model_state_dict": model.state_dict(), "pct": pct, "update": update, "eval_score": eval_score}, args.best_checkpoint)
-                print(f"-> Saved best checkpoint (score={eval_score:.3f})")
-            
-            for mp in milestone_pcts:
-                if mp not in saved_milestones and pct >= mp - 0.005:
-                    saved_milestones.add(mp)
-                    ms_name = f"milestone_{mp*100:.0f}pct"
-                    ms_path = milestone_dir / f"{ms_name}_update{update}.pt"
-                    torch.save({"model_state_dict": model.state_dict(), "pct": pct, "update": update, "eval_score": eval_score}, ms_path)
-                    print(f"-> Saved milestone: {ms_path}")
-        
-        print(f"PPO {update+1}/{total_updates} | {pct*100:.1f}% | lr={current_lr:.2e} ent={current_ent:.4f} horizon={current_horizon} max_steps={current_max_steps}")
+        print(f"PPO {update+1}/{total_updates} | progress={pct*100:.1f}% | lr={current_lr:.2e} ent={current_ent:.4f} horizon={current_horizon} max_steps={current_max_steps}")
         
         trajectories = collect_ppo_rollout(
             model,
@@ -1383,6 +1379,12 @@ def train_ppo(model, device, args):
                 opt.step()
         print(f"PPO {update+1}/{total_updates}: reward_mean={np.mean(flat_batch.rewards):.3f}, samples={len(actions)}")
         
+        pct_after = (update + 1) / total_updates
+        
+        # Evaluation after PPO update (uses the just-trained model)
+        if (update + 1) % eval_interval == 0:
+            run_eval(pct_after, update + 1)
+        
         # Save snapshot
         if (update + 1) % max(1, int(getattr(args, "snapshot_interval", 10))) == 0:
             snap = PolicyValueNet().to(device)
@@ -1390,7 +1392,7 @@ def train_ppo(model, device, args):
             snap.eval()
             snapshot_models.append(snap)
             snap_path = milestone_dir / f"snapshot_update{update+1}.pt"
-            torch.save({"model_state_dict": model.state_dict(), "pct": pct, "update": update + 1}, snap_path)
+            torch.save({"model_state_dict": model.state_dict(), "pct": pct_after, "update": update + 1}, snap_path)
             print(f"Saved snapshot: {snap_path}")
         
         # Adaptive priority adjustment
@@ -1405,6 +1407,9 @@ def train_ppo(model, device, args):
                     elif wr < 0.35:
                         entry["priority"] = min(20, entry["priority"] * 1.15)
                         print(f"Adapt: increased {entry.get('label', entry['agent'])} priority to {entry['priority']:.1f} (WR={wr:.2f})")
+
+    # Force final evaluation + milestone at 100%
+    run_eval(1.0, total_updates, force_milestones=True)
 
 
 EXPORT_AGENT_TEMPLATE = """from collections import deque
