@@ -1228,15 +1228,15 @@ def evaluate_agent_win_rate(model, device, max_steps, num_matches=20, agent_type
 
 def train_ppo(model, device, args):
     total_updates = max(1, args.ppo_updates)
-    lr_start = getattr(args, "ppo_lr_start", args.ppo_lr)
-    lr_end = getattr(args, "ppo_lr_end", args.ppo_lr)
-    ent_start = getattr(args, "ppo_ent_start", args.ent_coef)
-    ent_end = getattr(args, "ppo_ent_end", args.ent_coef)
-    horizon_start = getattr(args, "ppo_horizon_start", args.ppo_horizon)
-    horizon_end = getattr(args, "ppo_horizon_end", args.ppo_horizon)
-    max_steps_start = getattr(args, "max_steps_start", args.max_steps)
-    max_steps_end = getattr(args, "max_steps_end", args.max_steps)
-    milestone_pcts = getattr(args, "milestone_pcts", [0.0, 0.10, 0.25, 0.40, 0.55, 0.70, 0.85, 1.0])
+    lr_start = args.ppo_lr_start if args.ppo_lr_start is not None else args.ppo_lr
+    lr_end = args.ppo_lr_end if args.ppo_lr_end is not None else args.ppo_lr
+    ent_start = args.ppo_ent_start if args.ppo_ent_start is not None else args.ent_coef
+    ent_end = args.ppo_ent_end if args.ppo_ent_end is not None else args.ent_coef
+    horizon_start = args.ppo_horizon_start if args.ppo_horizon_start is not None else args.ppo_horizon
+    horizon_end = args.ppo_horizon_end if args.ppo_horizon_end is not None else args.ppo_horizon
+    max_steps_start = args.max_steps_start if args.max_steps_start is not None else args.max_steps
+    max_steps_end = args.max_steps_end if args.max_steps_end is not None else args.max_steps
+    milestone_pcts = args.milestone_pcts if args.milestone_pcts is not None else [0.0, 0.10, 0.25, 0.40, 0.55, 0.70, 0.85, 1.0]
     
     opt = torch.optim.AdamW(model.parameters(), lr=lr_start, weight_decay=1e-4)
     snapshot_models = deque(maxlen=24)
