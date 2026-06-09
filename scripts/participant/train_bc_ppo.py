@@ -570,15 +570,36 @@ def sample_masked_action(model, spatial, scalar, mask, deterministic=False):
     return action, dist.log_prob(action), dist.entropy(), value
 
 
-def rank_players(env):
+def rank_players(env, death_steps=None):
+    """BTC-accurate ranking.
+    
+    Rules (from BTC benchmark):
+      - Dead earliest → worst rank.
+      - Dead same step → same rank among those dead.
+      - Survivors after max steps → tie-break by kills → boxes → items → bombs.
+      - Survivors always rank better than dead players.
+    
+    Args:
+        env: The BomberEnv instance.
+        death_steps: dict mapping player_id → step when they died.
+                     If None, falls back to arbitrary dead ordering (legacy).
+    """
+    if death_steps is None:
+        death_steps = {}
+    
     survivors = [i for i, p in enumerate(env.players) if p.alive]
+    dead = [i for i in range(4) if i not in survivors]
+    
     stats_key = lambda i: (
         env.players[i].stats["kills"],
         env.players[i].stats["boxes"],
         env.players[i].stats["items"],
         env.players[i].stats["bombs"],
     )
-    ranks = [3] * 4
+    
+    ranks = [0] * 4
+    
+    # --- Rank survivors by stats tie-break (best stats = rank 0) ---
     if survivors:
         ordered = sorted(survivors, key=stats_key, reverse=True)
         rank = 0
@@ -586,10 +607,19 @@ def rank_players(env):
             if idx > 0 and stats_key(pid) < stats_key(ordered[idx - 1]):
                 rank = idx
             ranks[pid] = rank
-    dead = [i for i in range(4) if i not in survivors]
-    base = max([ranks[i] for i in survivors], default=-1) + 1
-    for offset, pid in enumerate(dead):
-        ranks[pid] = base + offset
+    
+    # --- Rank dead players by death step (died later = better rank) ---
+    if dead:
+        # Base rank for dead: one worse than worst survivor
+        base = max((ranks[i] for i in survivors), default=-1) + 1
+        # Sort dead by death_step descending (died later → ranked better)
+        dead_sorted = sorted(dead, key=lambda i: death_steps.get(i, 0), reverse=True)
+        rank = base
+        for idx, pid in enumerate(dead_sorted):
+            if idx > 0 and death_steps.get(pid, 0) < death_steps.get(dead_sorted[idx - 1], 0):
+                rank = base + idx
+            ranks[pid] = rank
+    
     return ranks
 
 
@@ -663,7 +693,7 @@ def _get_safe_actions_mask(obs, aid):
     return mask
 
 
-def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, cur_stats=None, stage=0, prev_visited_positions=None):
+def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, cur_stats=None, stage=0, prev_visited_positions=None, death_steps=None):
     if prev_obs is None:
         return 0.0
     prev_p = prev_obs["players"][agent_id]
@@ -746,7 +776,7 @@ def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, c
 
     # Terminal rank rewards
     if done:
-        ranks = rank_players(env)
+        ranks = rank_players(env, death_steps=death_steps)
         rank_val = ranks[agent_id]
         
         if stage <= 5:
@@ -870,6 +900,8 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
                         
         prev_obs = None
         prev_stats = None
+        death_steps = {}
+        prev_alive = {i: True for i in range(4)}
         prev_visited_positions = deque(maxlen=4)
         
         for step in range(horizon):
@@ -899,11 +931,17 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             next_obs, terminated, truncated = env.step(actions)
             done = bool(terminated or truncated)
             
+            # Track death steps for BTC-accurate ranking
+            for i in range(4):
+                if prev_alive[i] and not env.players[i].alive:
+                    death_steps[i] = step
+                    prev_alive[i] = False
+            
             cur_stats = None
             if env.players[control_id] is not None:
                 cur_stats = env.players[control_id].stats.copy()
                 
-            reward = shaped_reward(prev_obs, next_obs, env, control_id, actions[control_id], done, prev_stats, cur_stats, stage=stage, prev_visited_positions=prev_visited_positions)
+            reward = shaped_reward(prev_obs, next_obs, env, control_id, actions[control_id], done, prev_stats, cur_stats, stage=stage, prev_visited_positions=prev_visited_positions, death_steps=death_steps)
             
             if env.players[control_id] is not None and getattr(env.players[control_id], "alive", False):
                 prev_visited_positions.append((int(env.players[control_id].x), int(env.players[control_id].y)))
@@ -969,6 +1007,8 @@ def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20):
         for i in range(1, 4):
             agents.append(make_agent(random.choice(opps), i))
             
+        death_steps = {}
+        prev_alive = {i: True for i in range(4)}
         for step in range(max_steps):
             actions = []
             for i, agent in enumerate(agents):
@@ -978,9 +1018,14 @@ def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20):
                     action = 0
                 actions.append(action if 0 <= action < ACTIONS else 0)
             obs, terminated, truncated = env.step(actions)
+            # Track death steps for BTC-accurate ranking
+            for i in range(4):
+                if prev_alive[i] and not env.players[i].alive:
+                    death_steps[i] = step
+                    prev_alive[i] = False
             if terminated or truncated:
                 break
-        ranks = rank_players(env)
+        ranks = rank_players(env, death_steps=death_steps)
         if ranks[0] == 0:
             winners = [i for i in range(4) if ranks[i] == 0]
             if len(winners) == 1:
