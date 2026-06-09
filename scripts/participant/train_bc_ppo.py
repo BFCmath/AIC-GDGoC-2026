@@ -111,7 +111,7 @@ DEFAULT_REWARD_CONFIG = {
     "strength_weighting": True,
 }
 
-EVAL_OPPONENTS = ["agent/codex/7.py", "agent/codex/7.py", "agent/codex/7.py"]
+EVAL_OPPONENTS = ["agent/codex/4.py", "agent/codex/7.py", "agent/codex/8.py"]
 
 EXPERT_SAMPLE_POOL = (
     ["agent/codex/8.py"] * 5
