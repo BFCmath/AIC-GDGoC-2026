@@ -1032,7 +1032,7 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
         opponent_schedule = OPPONENT_SCHEDULE
     trajectories = []
     model.eval()
-    snapshot_models = snapshot_models or []
+    snapshot_models = snapshot_models or deque()
     pct = update / max(1, total_updates)
     snap_prob = min(0.35, 0.4 * pct)
     opp_dist = build_opponent_dist(opponent_schedule, pct, win_counters)
@@ -1239,7 +1239,7 @@ def train_ppo(model, device, args):
     milestone_pcts = getattr(args, "milestone_pcts", [0.0, 0.10, 0.25, 0.40, 0.55, 0.70, 0.85, 1.0])
     
     opt = torch.optim.AdamW(model.parameters(), lr=lr_start, weight_decay=1e-4)
-    snapshot_models = []
+    snapshot_models = deque(maxlen=24)
     
     initial_snap = PolicyValueNet().to(device)
     initial_snap.load_state_dict({k: v.detach().clone() for k, v in model.state_dict().items()})
