@@ -663,45 +663,51 @@ def _get_safe_actions_mask(obs, aid):
     return mask
 
 
-def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, cur_stats=None, stage=3):
+def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, cur_stats=None, stage=0, prev_visited_positions=None):
     if prev_obs is None:
         return 0.0
     prev_p = prev_obs["players"][agent_id]
     cur_p = obs["players"][agent_id]
     
-    # Step reward: +0.03 survive one step
-    reward = 0.03 if int(prev_p[2]) == 1 else 0.0
+    # Step reward: -0.01 per step to encourage speed
+    reward = -0.01 if int(prev_p[2]) == 1 else 0.0
     
-    # Death penalty: -8.0
+    # Death penalty: -10.0
     if int(prev_p[2]) == 1 and int(cur_p[2]) == 0:
-        reward -= 8.0
+        reward -= 10.0
         prev_pos = (int(prev_p[0]), int(prev_p[1]))
-        # extra -0.8 if dead by own bomb
         if is_death_by_own_bomb(prev_obs, prev_pos, agent_id):
             reward -= 0.8
 
     if prev_stats is not None and cur_stats is not None:
-        # kill opponent: +4.0
+        # kill opponent: +5.0 (and +10.0 bounty in boss stages 2-5)
         kills_diff = cur_stats["kills"] - prev_stats["kills"]
         if kills_diff > 0:
-            reward += 4.0 * kills_diff
+            reward += 5.0 * kills_diff
+            if 2 <= stage <= 5:
+                reward += 10.0 * kills_diff
             
-        # destroy box: +0.08
+        # destroy box: +0.5
         boxes_diff = cur_stats["boxes"] - prev_stats["boxes"]
         if boxes_diff > 0:
-            reward += 0.08 * boxes_diff
+            reward += 0.5 * boxes_diff
 
-    # collect item: +0.15
+    # collect item: +1.0
     capacity_diff = int(cur_p[3]) - int(prev_p[3])
     radius_diff = int(cur_p[4]) - int(prev_p[4])
     if capacity_diff > 0:
-        reward += 0.15 * capacity_diff
+        reward += 1.0 * capacity_diff
     if radius_diff > 0:
-        reward += 0.15 * radius_diff
+        reward += 1.0 * radius_diff
 
     # leave danger: +0.30
     prev_pos = (int(prev_p[0]), int(prev_p[1]))
     cur_pos = (int(cur_p[0]), int(cur_p[1]))
+    
+    # Wiggle penalty
+    if action != 0 and prev_visited_positions is not None and cur_pos in prev_visited_positions:
+        reward -= 0.05
+        
     prev_danger = danger_schedule(prev_obs["map"], prev_obs["bombs"], prev_obs["players"], horizon=3)
     cur_danger = danger_schedule(obs["map"], obs["bombs"], obs["players"], horizon=3)
     
@@ -715,14 +721,11 @@ def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, c
     if not in_prev_danger and in_cur_danger:
         reward -= 0.70
         
-    # standing in future danger (minor penalty for step-to-step danger overlap)
+    # standing in future danger
     if cur_pos in cur_danger.get(1, set()) or cur_pos in cur_danger.get(2, set()):
         reward -= 0.2
 
     # place bomb value:
-    # +0.25 place bomb that hits box and has escape path
-    # +0.80 place bomb that traps/threatens enemy and has escape path
-    # -1.50 place bomb with no escape
     if action == 5:
         has_escape = can_escape_after_bomb(prev_obs, agent_id)
         if not has_escape:
@@ -737,23 +740,30 @@ def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, c
             elif boxes > 0:
                 reward += 0.25
                 
-    # useless STOP when safe: -0.02
+    # useless STOP when safe
     if action == 0 and not in_prev_danger:
         reward -= 0.02
 
     # Terminal rank rewards
     if done:
         ranks = rank_players(env)
-        ranks_reward = {0: 10.0, 1: 1.0, 2: -2.0, 3: -6.0}
         rank_val = ranks[agent_id]
-        if rank_val == 0:
-            winners = [i for i in range(4) if ranks[i] == 0]
-            if len(winners) > 1:
-                reward += 3.0
+        
+        if stage <= 5:
+            if rank_val == 0:
+                reward += 15.0
             else:
-                reward += 10.0
-        else:
-            reward += ranks_reward.get(rank_val, -6.0)
+                reward -= 10.0
+        elif stage == 6:
+            if rank_val == 0:
+                reward += 15.0
+            elif rank_val == 1:
+                reward += 5.0
+            else:
+                reward -= 10.0
+        else:  # stage 7
+            ranks_reward = {0: 15.0, 1: 5.0, 2: -5.0, 3: -15.0}
+            reward += ranks_reward.get(rank_val, -15.0)
             
     return float(reward)
 
