@@ -1008,7 +1008,7 @@ def train_ppo(model, device, args):
     snapshot_models.append(initial_snap)
     
     stage = 0
-    eval_interval = 5
+    eval_interval = 25
     
     for update in range(args.ppo_updates):
         stage_cfg = CURRICULUM_CONFIG.get(stage, {"max_steps": args.max_steps, "win_rate": 0.40})
