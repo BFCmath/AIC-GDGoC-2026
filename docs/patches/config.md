@@ -6,7 +6,7 @@ BC_EPOCHS = 40
 PPO_UPDATES = 900
 PPO_ENVS = 16
 PPO_HORIZON = 128
-EVAL_MATCHES = 12
+EVAL_MATCHES = 8
 ```
 
 This is the config I would run first on Kaggle/Colab with GPU.
