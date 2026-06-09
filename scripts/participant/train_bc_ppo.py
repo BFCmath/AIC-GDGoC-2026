@@ -859,46 +859,22 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             if i == control_id:
                 agents.append(NeuralSafeAgent(i, model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
             else:
-                if stage == 1:
-                    # Stage 1: mostly random/weak/noisy (70%) and Codex 4/7 (30%)
-                    r = random.random()
-                    if r < 0.70:
-                        agents.append(make_agent(random.choice(["RandomAgent", "SimpleRuleAgent", "BoxFarmerAgent"]), i))
-                    else:
-                        agents.append(make_agent(random.choice(["agent/codex/4.py", "agent/codex/7.py"]), i))
+                if stage == 0:
+                    agents.append(make_agent(random.choice(["RandomAgent", "SimpleRuleAgent"]), i))
+                elif stage == 1:
+                    agents.append(make_agent(random.choice(["TacticalRuleAgent", "SmarterRuleAgent", "BoxFarmerAgent"]), i))
                 elif stage == 2:
-                    # Stage 2: mostly rule-based (60%) and Codex 4/7 (40%)
-                    r = random.random()
-                    if r < 0.60:
-                        agents.append(make_agent(random.choice(["TacticalRuleAgent", "GeniusRuleAgent", "SmarterRuleAgent"]), i))
-                    else:
-                        agents.append(make_agent(random.choice(["agent/codex/4.py", "agent/codex/7.py"]), i))
+                    agents.append(make_agent(random.choice(["agent/codex/4.py", "SimpleRuleAgent", "SimpleRuleAgent"]), i))
                 elif stage == 3:
-                    # Stage 3: 30% top local, 25% snapshots, 20% rule, 15% weak, 10% current
-                    r = random.random()
-                    if r < 0.30:
-                        agents.append(make_agent(random.choice(["agent/codex/7.py", "agent/codex/4.py"]), i))
-                    elif r < 0.55:
-                        if snapshot_models:
-                            snap_model = random.choice(snapshot_models)
-                            agents.append(NeuralSafeAgent(i, snap_model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
-                        else:
-                            agents.append(make_agent("agent/codex/7.py", i))
-                    elif r < 0.75:
-                        agents.append(make_agent(random.choice(["TacticalRuleAgent", "GeniusRuleAgent", "SmarterRuleAgent"]), i))
-                    elif r < 0.90:
-                        agents.append(make_agent(random.choice(["RandomAgent", "SimpleRuleAgent", "BoxFarmerAgent"]), i))
-                    else:
-                        agents.append(NeuralSafeAgent(i, model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
-                else: # Stage 4: only top snapshots, Codex 7, and Codex 4
-                    r = random.random()
-                    if r < 0.40:
-                        agents.append(make_agent(random.choice(["agent/codex/7.py", "agent/codex/4.py"]), i))
-                    elif r < 0.80 and snapshot_models:
-                        snap_model = random.choice(snapshot_models)
-                        agents.append(NeuralSafeAgent(i, snap_model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
-                    else:
-                        agents.append(NeuralSafeAgent(i, model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
+                    agents.append(make_agent(random.choice(["agent/codex/8.py", "SimpleRuleAgent", "SimpleRuleAgent"]), i))
+                elif stage == 4:
+                    agents.append(make_agent(random.choice(["agent/codex/7.py", "SimpleRuleAgent", "SimpleRuleAgent"]), i))
+                elif stage == 5:
+                    agents.append(make_agent(random.choice(["agent/codex/7.py", "TacticalRuleAgent", "SmarterRuleAgent"]), i))
+                elif stage == 6:
+                    agents.append(make_agent(random.choice(["agent/codex/8.py", "agent/codex/4.py", "TacticalRuleAgent"]), i))
+                else: # Stage 7
+                    agents.append(make_agent(random.choice(["agent/codex/7.py", "agent/codex/4.py", "agent/codex/8.py"]), i))
                         
         prev_obs = None
         prev_stats = None
@@ -971,27 +947,78 @@ def compute_gae(rewards, dones, values, gamma, gae_lambda):
     return advantages.astype(np.float32), returns.astype(np.float32)
 
 
+def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20):
+    wins = 0
+    model.eval()
+    for match in range(num_matches):
+        env = BomberEnv(max_steps=max_steps, seed=1000000 + stage * 1000 + match)
+        obs = env.reset(seed=1000000 + stage * 1000 + match)
+        
+        agents = []
+        agents.append(NeuralSafeAgent(0, model, device, deterministic=True, fallback_agent=make_agent("agent/codex/7.py", 0)))
+        
+        if stage == 0:
+            opps = ["RandomAgent", "SimpleRuleAgent"]
+        elif stage == 1:
+            opps = ["TacticalRuleAgent", "SmarterRuleAgent", "BoxFarmerAgent"]
+        elif stage == 2:
+            opps = ["agent/codex/4.py", "SimpleRuleAgent", "SimpleRuleAgent"]
+        elif stage == 3:
+            opps = ["agent/codex/8.py", "SimpleRuleAgent", "SimpleRuleAgent"]
+        elif stage == 4:
+            opps = ["agent/codex/7.py", "SimpleRuleAgent", "SimpleRuleAgent"]
+        elif stage == 5:
+            opps = ["agent/codex/7.py", "TacticalRuleAgent", "SmarterRuleAgent"]
+        elif stage == 6:
+            opps = ["agent/codex/8.py", "agent/codex/4.py", "TacticalRuleAgent"]
+        else: # stage 7
+            opps = ["agent/codex/7.py", "agent/codex/4.py", "agent/codex/8.py"]
+            
+        for i in range(1, 4):
+            agents.append(make_agent(random.choice(opps), i))
+            
+        for step in range(max_steps):
+            actions = []
+            for i, agent in enumerate(agents):
+                try:
+                    action = int(agent.act(obs))
+                except Exception:
+                    action = 0
+                actions.append(action if 0 <= action < ACTIONS else 0)
+            obs, terminated, truncated = env.step(actions)
+            if terminated or truncated:
+                break
+        ranks = rank_players(env)
+        if ranks[0] == 0:
+            winners = [i for i in range(4) if ranks[i] == 0]
+            if len(winners) == 1:
+                wins += 1
+    return float(wins) / num_matches
+
 def train_ppo(model, device, args):
     opt = torch.optim.AdamW(model.parameters(), lr=args.ppo_lr, weight_decay=1e-4)
     snapshot_models = []
     
-    # Initial snapshot of behavior cloned model
     initial_snap = PolicyValueNet().to(device)
     initial_snap.load_state_dict({k: v.detach().clone() for k, v in model.state_dict().items()})
     initial_snap.eval()
     snapshot_models.append(initial_snap)
     
+    stage = 0
+    eval_interval = 5
+    
     for update in range(args.ppo_updates):
-        # Determine curriculum stage (1 to 4)
-        progress = float(update) / float(args.ppo_updates)
-        if progress < 0.25:
-            stage = 1
-        elif progress < 0.50:
-            stage = 2
-        elif progress < 0.75:
-            stage = 3
-        else:
-            stage = 4
+        
+        # Evaluate and potentially advance stage
+        if update > 0 and update % eval_interval == 0 and stage < 7:
+            print(f"--- Evaluating Stage {stage} ---")
+            win_rate = evaluate_agent_win_rate(model, device, stage, args.max_steps, num_matches=10)
+            print(f"Win Rate: {win_rate*100:.1f}% (Threshold: 40.0%)")
+            if win_rate >= 0.40:
+                stage += 1
+                print(f"-> ADVANCED TO STAGE {stage}!")
+            else:
+                print("-> Retrying stage...")
 
         print(f"PPO Update {update + 1}/{args.ppo_updates} | Curriculum Stage {stage}")
         batch = collect_ppo_rollout(
