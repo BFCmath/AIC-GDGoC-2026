@@ -17,7 +17,7 @@ import json
 import random
 import sys
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -93,16 +93,25 @@ OPPONENT_SPECS = [
     "RandomAgent",
 ]
 
-STAGE_OPPONENT_POOLS = {
-    0: ["RandomAgent", "SimpleRuleAgent", "SmarterRuleAgent"],
-    1: ["TacticalRuleAgent", "SmarterRuleAgent", "BoxFarmerAgent", "GeniusRuleAgent"],
-    2: ["agent/codex/4.py", "agent/codex/1.py", "SimpleRuleAgent", "TacticalRuleAgent"],
-    3: ["agent/codex/8.py", "agent/codex/3.py", "SmarterRuleAgent", "TacticalRuleAgent"],
-    4: ["agent/codex/7.py", "agent/codex/4.py", "GeniusRuleAgent", "TacticalRuleAgent"],
-    5: ["agent/codex/8.py", "agent/codex/7.py", "agent/codex/4.py", "SmarterRuleAgent"],
-    6: ["agent/codex/8.py", "agent/codex/7.py", "agent/codex/6.py", "agent/codex/4.py", "TacticalRuleAgent"],
-    7: ["agent/codex/8.py", "agent/codex/7.py", "agent/codex/6.py", "agent/codex/5.py", "agent/codex/4.py"],
+OPPONENT_SCHEDULE = [
+    {"agent": "RandomAgent", "strength": 0.10, "start_pct": 0.00, "peak_end_pct": 0.08, "end_pct": 0.35, "priority": 8, "label": "random"},
+    {"agent": "SimpleRuleAgent", "strength": 0.20, "start_pct": 0.00, "peak_end_pct": 0.12, "end_pct": 0.45, "priority": 8, "label": "simple_rule"},
+    {"agent": "BoxFarmerAgent", "strength": 0.30, "start_pct": 0.08, "peak_end_pct": 0.22, "end_pct": 0.60, "priority": 8, "label": "box_farmer"},
+    {"agent": "SmarterRuleAgent", "strength": 0.40, "start_pct": 0.12, "peak_end_pct": 0.30, "end_pct": 0.72, "priority": 8, "label": "smarter_rule"},
+    {"agent": "TacticalRuleAgent", "strength": 0.50, "start_pct": 0.20, "peak_end_pct": 0.45, "end_pct": 0.90, "priority": 8, "label": "tactical_rule"},
+    {"agent": "agent/codex/4.py", "strength": 0.70, "start_pct": 0.25, "peak_end_pct": 0.55, "end_pct": 1.00, "priority": 10, "label": "codex4"},
+    {"agent": "agent/codex/8.py", "strength": 0.85, "start_pct": 0.35, "peak_end_pct": 0.65, "end_pct": 1.00, "priority": 10, "label": "codex8"},
+    {"agent": "agent/codex/7.py", "strength": 1.00, "start_pct": 0.45, "peak_end_pct": 0.75, "end_pct": 1.00, "priority": 10, "label": "codex7"},
+]
+
+DEFAULT_REWARD_CONFIG = {
+    "rank_rewards": [15.0, 0.0, -10.0, -10.0],
+    "win_strength_offset": 0.5,
+    "loss_penalty_mult": 0.75,
+    "strength_weighting": True,
 }
+
+EVAL_OPPONENTS = ["agent/codex/7.py", "agent/codex/7.py", "agent/codex/7.py"]
 
 EXPERT_SAMPLE_POOL = (
     ["agent/codex/8.py"] * 5
@@ -114,6 +123,54 @@ EXPERT_SAMPLE_POOL = (
     + ["TacticalRuleAgent", "GeniusRuleAgent", "SmarterRuleAgent", "BoxFarmerAgent"]
 )
 
+
+
+def compute_priority(entry: dict, pct: float) -> float:
+    if pct < entry["start_pct"] or pct >= entry["end_pct"]:
+        return 0.0
+    if pct <= entry["peak_end_pct"]:
+        return float(entry["priority"])
+    decay_range = entry["end_pct"] - entry["peak_end_pct"]
+    if decay_range <= 0:
+        return float(entry["priority"])
+    progress = (pct - entry["peak_end_pct"]) / decay_range
+    return float(entry["priority"]) * (1.0 - progress)
+
+
+def build_opponent_dist(schedule: list, pct: float, win_counters: dict | None = None):
+    entries = []
+    total = 0.0
+    for entry in schedule:
+        pri = compute_priority(entry, pct)
+        if pri > 0:
+            if win_counters:
+                stats = win_counters.get(entry["agent"], {"wins": 0, "total": 0})
+                if stats["total"] >= 10:
+                    wr = stats["wins"] / stats["total"]
+                    if wr > 0.75:
+                        pri *= 0.85
+                    elif wr < 0.35:
+                        pri *= 1.15
+            if pri > 0:
+                entries.append((entry["agent"], entry["strength"], pri, entry.get("label", "")))
+                total += pri
+    if not entries:
+        entries = [(e["agent"], e["strength"], 1.0, e.get("label", "")) for e in schedule if e["start_pct"] <= pct < e["end_pct"]]
+        total = sum(e[2] for e in entries) or 1
+    return [(a, s, p / total, l) for (a, s, p, l) in entries]
+
+
+def sample_opponent(dist: list) -> str:
+    agents = [d[0] for d in dist]
+    probs = [d[2] for d in dist]
+    return random.choices(agents, weights=probs, k=1)[0]
+
+
+def get_opponent_strength(schedule: list, agent_spec: str) -> float:
+    for entry in schedule:
+        if entry["agent"] == agent_spec:
+            return entry["strength"]
+    return 1.0
 
 
 def seed_everything(seed: int) -> None:
@@ -749,7 +806,7 @@ def _get_safe_actions_mask(obs, aid):
     return mask
 
 
-def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, cur_stats=None, stage=0, prev_visited_positions=None, death_steps=None):
+def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, cur_stats=None, stage=0, prev_visited_positions=None, death_steps=None, opponent_strengths=None, reward_config=None):
     if prev_obs is None:
         return 0.0
     prev_p = prev_obs["players"][agent_id]
@@ -837,8 +894,6 @@ def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, c
 
     # Terminal rank rewards
     if done:
-        # Add a small normalized terminal stat lead bonus aligned with BTC
-        # truncated-game tie-breakers.
         try:
             me = env.players[agent_id].stats
             opp_stats = [env.players[i].stats for i in range(4) if i != agent_id]
@@ -851,24 +906,28 @@ def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, c
             reward += float(stat_bonus)
         except Exception:
             pass
+        
         ranks = rank_players(env, death_steps=death_steps)
         rank_val = ranks[agent_id]
         
-        if stage <= 5:
-            if rank_val == 0:
-                reward += 15.0
-            else:
-                reward -= 10.0
-        elif stage == 6:
-            if rank_val == 0:
-                reward += 15.0
-            elif rank_val == 1:
-                reward += 5.0
-            else:
-                reward -= 10.0
-        else:  # stage 7
-            ranks_reward = {0: 15.0, 1: 5.0, 2: -5.0, 3: -15.0}
-            reward += ranks_reward.get(rank_val, -15.0)
+        if reward_config is None:
+            reward_config = DEFAULT_REWARD_CONFIG
+        
+        if opponent_strengths:
+            avg_strength = sum(opponent_strengths) / len(opponent_strengths)
+        else:
+            avg_strength = 1.0
+        
+        if rank_val == 0:
+            offset = reward_config.get("win_strength_offset", 0.5)
+            terminal = reward_config["rank_rewards"][0] * (offset + avg_strength)
+        elif rank_val == 1:
+            terminal = reward_config["rank_rewards"][1]
+        else:
+            mult = reward_config.get("loss_penalty_mult", 0.75)
+            terminal = reward_config["rank_rewards"][2] * (1.0 + mult * (1.0 - avg_strength))
+        
+        reward += terminal
             
     return float(reward)
 
@@ -898,10 +957,6 @@ class PPOBatch:
     @classmethod
     def empty(cls):
         return cls([], [], [], [], [], [], [], [])
-
-
-def opponent_pool_for_stage(stage: int):
-    return STAGE_OPPONENT_POOLS.get(int(stage), STAGE_OPPONENT_POOLS[7])
 
 
 def make_snapshot_agent(snapshot_models, agent_id, device):
@@ -965,10 +1020,15 @@ class NeuralSafeAgent:
         return int(action.item())
 
 
-def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_models=None, stage=0):
+def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_models=None, update=0, total_updates=1, opponent_schedule=None, win_counters=None):
+    if opponent_schedule is None:
+        opponent_schedule = OPPONENT_SCHEDULE
     trajectories = []
     model.eval()
     snapshot_models = snapshot_models or []
+    pct = update / max(1, total_updates)
+    snap_prob = min(0.35, 0.4 * pct)
+    opp_dist = build_opponent_dist(opponent_schedule, pct, win_counters)
     
     for env_idx in range(envs):
         batch = PPOBatch.empty()
@@ -976,21 +1036,20 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
         env = BomberEnv(max_steps=max_steps, seed=seed + env_idx)
         obs = env.reset(seed=seed + env_idx)
         
-        # Build self-play/opponent pool based on stage
         agents = []
+        episode_opponent_types = []
         for i in range(4):
             if i == control_id:
                 agents.append(NeuralSafeAgent(i, model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
             else:
-                # League sampling: top/local teachers + occasional old neural snapshots.
-                # This matches the online ladder idea better than only training vs 4.py/7.py.
-                snap_prob = min(0.35, 0.06 * max(0, stage))
                 snap_agent = make_snapshot_agent(snapshot_models, i, device) if random.random() < snap_prob else None
                 if snap_agent is not None:
                     agents.append(snap_agent)
                 else:
-                    agents.append(make_agent(random.choice(opponent_pool_for_stage(stage)), i))
-                        
+                    opp_name = sample_opponent(opp_dist)
+                    agents.append(make_agent(opp_name, i))
+                    episode_opponent_types.append(opp_name)
+        
         death_steps = {}
         prev_alive = {i: True for i in range(4)}
         prev_visited_positions = deque(maxlen=4)
@@ -1031,7 +1090,6 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             next_obs, terminated, truncated = env.step(actions)
             done = bool(terminated or truncated)
             
-            # Track death steps for BTC-accurate ranking
             for i in range(4):
                 if prev_alive[i] and not env.players[i].alive:
                     death_steps[i] = step
@@ -1040,8 +1098,15 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             cur_stats = None
             if env.players[control_id] is not None:
                 cur_stats = env.players[control_id].stats.copy()
-                
-            reward = shaped_reward(prev_obs_for_reward, next_obs, env, control_id, actions[control_id], done, prev_stats, cur_stats, stage=stage, prev_visited_positions=prev_visited_positions, death_steps=death_steps)
+            
+            opponent_strengths = [get_opponent_strength(opponent_schedule, opp) for opp in episode_opponent_types]
+            reward = shaped_reward(
+                prev_obs_for_reward, next_obs, env, control_id, actions[control_id], done,
+                prev_stats, cur_stats, stage=0,
+                prev_visited_positions=prev_visited_positions,
+                death_steps=death_steps,
+                opponent_strengths=opponent_strengths,
+            )
             
             if env.players[control_id] is not None and getattr(env.players[control_id], "alive", False):
                 prev_visited_positions.append((int(env.players[control_id].x), int(env.players[control_id].y)))
@@ -1054,6 +1119,15 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             
             if done:
                 break
+        
+        if win_counters is not None and batch.actions:
+            ranks = rank_players(env, death_steps=death_steps)
+            if ranks[control_id] == 0:
+                for opp in episode_opponent_types:
+                    win_counters[opp]["wins"] += 1
+            for opp in episode_opponent_types:
+                win_counters[opp]["total"] += 1
+        
         if batch.actions:
             trajectories.append(batch)
     return trajectories
@@ -1076,14 +1150,16 @@ def compute_gae(rewards, dones, values, gamma, gae_lambda):
     return advantages.astype(np.float32), returns.astype(np.float32)
 
 
-def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20, agent_type="fallback"):
+def evaluate_agent_win_rate(model, device, max_steps, num_matches=20, agent_type="fallback", eval_opponents=None):
+    if eval_opponents is None:
+        eval_opponents = EVAL_OPPONENTS
     wins = 0
     total_fallback = 0
     total_steps = 0
     model.eval()
     for match in range(num_matches):
-        env = BomberEnv(max_steps=max_steps, seed=1000000 + stage * 1000 + match)
-        obs = env.reset(seed=1000000 + stage * 1000 + match)
+        env = BomberEnv(max_steps=max_steps, seed=1000000 + match)
+        obs = env.reset(seed=1000000 + match)
         
         agents = []
         if agent_type == "neural":
@@ -1097,9 +1173,8 @@ def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20, age
             
         agents.append(agent)
         
-        opps = opponent_pool_for_stage(stage)
         for i in range(1, 4):
-            agents.append(make_agent(random.choice(opps), i))
+            agents.append(make_agent(random.choice(eval_opponents), i))
             
         death_steps = {}
         prev_alive = {i: True for i in range(4)}
@@ -1135,19 +1210,19 @@ def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20, age
     fallback_rate = total_fallback / max(1, total_steps)
     return float(wins) / num_matches, fallback_rate
 
-CURRICULUM_CONFIG = {
-    0: {"max_steps": 150, "win_rate": 0.80},
-    1: {"max_steps": 150, "win_rate": 0.80},
-    2: {"max_steps": 250, "win_rate": 0.30},
-    3: {"max_steps": 250, "win_rate": 0.30},
-    4: {"max_steps": 350, "win_rate": 0.30},
-    5: {"max_steps": 350, "win_rate": 0.30},
-    6: {"max_steps": 500, "win_rate": 0.30},
-    7: {"max_steps": 500, "win_rate": 0.30},
-}
-
 def train_ppo(model, device, args):
-    opt = torch.optim.AdamW(model.parameters(), lr=args.ppo_lr, weight_decay=1e-4)
+    total_updates = max(1, args.ppo_updates)
+    lr_start = getattr(args, "ppo_lr_start", args.ppo_lr)
+    lr_end = getattr(args, "ppo_lr_end", args.ppo_lr)
+    ent_start = getattr(args, "ppo_ent_start", args.ent_coef)
+    ent_end = getattr(args, "ppo_ent_end", args.ent_coef)
+    horizon_start = getattr(args, "ppo_horizon_start", args.ppo_horizon)
+    horizon_end = getattr(args, "ppo_horizon_end", args.ppo_horizon)
+    max_steps_start = getattr(args, "max_steps_start", args.max_steps)
+    max_steps_end = getattr(args, "max_steps_end", args.max_steps)
+    milestone_pcts = getattr(args, "milestone_pcts", [0.0, 0.10, 0.25, 0.40, 0.55, 0.70, 0.85, 1.0])
+    
+    opt = torch.optim.AdamW(model.parameters(), lr=lr_start, weight_decay=1e-4)
     snapshot_models = []
     
     initial_snap = PolicyValueNet().to(device)
@@ -1155,65 +1230,91 @@ def train_ppo(model, device, args):
     initial_snap.eval()
     snapshot_models.append(initial_snap)
     
-    stage = int(getattr(args, "fixed_stage", -1)) if int(getattr(args, "fixed_stage", -1)) >= 0 else int(getattr(args, "init_stage", 0))
-    eval_interval = max(1, int(getattr(args, "eval_interval", 5)))
-    eval_matches = max(1, int(getattr(args, "eval_matches", 10)))
+    eval_interval = max(1, int(getattr(args, "eval_interval", 10)))
+    eval_matches = max(1, int(getattr(args, "eval_matches", 12)))
     best_eval_score = -1e9
-    Path(getattr(args, "stage_checkpoint_dir", "checkpoints/stages")).mkdir(parents=True, exist_ok=True)
+    milestone_dir = Path(getattr(args, "stage_checkpoint_dir", "checkpoints/milestones"))
+    milestone_dir.mkdir(parents=True, exist_ok=True)
+    saved_milestones = set()
+    
+    # Load opponent schedule and reward config
+    opponent_schedule = list(OPPONENT_SCHEDULE)
+    reward_config = dict(DEFAULT_REWARD_CONFIG)
+    overrides_path = getattr(args, "overrides", "")
+    if overrides_path:
+        p = Path(overrides_path)
+        if not p.is_absolute():
+            p = ROOT / p
+        if p.exists():
+            data = json.loads(p.read_text())
+            if "opponent_schedule" in data:
+                opponent_schedule = data["opponent_schedule"]
+                print("Applied opponent_schedule from overrides")
+            if "reward" in data:
+                reward_config.update(data["reward"])
+                print("Applied reward config from overrides")
+    
+    win_counters = defaultdict(lambda: {"wins": 0, "total": 0})
     
     for update in range(args.ppo_updates):
-        stage_cfg = CURRICULUM_CONFIG.get(stage, {"max_steps": args.max_steps, "win_rate": 0.40})
-        stage_max_steps = stage_cfg["max_steps"]
-        stage_threshold = stage_cfg["win_rate"]
+        pct = update / total_updates
         
-        # Evaluate and potentially advance stage
+        # Scheduled hyperparameters
+        current_lr = lr_start + (lr_end - lr_start) * pct
+        current_ent = ent_start + (ent_end - ent_start) * pct
+        current_horizon = max(1, int(round(horizon_start + (horizon_end - horizon_start) * pct)))
+        current_max_steps = max(1, int(round(max_steps_start + (max_steps_end - max_steps_start) * pct)))
+        for pg in opt.param_groups:
+            pg["lr"] = current_lr
+        
+        # Evaluation and milestone checkpoints
         if update > 0 and update % eval_interval == 0:
-            print(f"--- Evaluating Stage {stage} ---")
+            print(f"--- Evaluation at {pct*100:.1f}% (update {update}/{total_updates}) ---")
             
-            win_rate_codex, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="codex7")
-            print(f"Codex 7         : Win Rate: {win_rate_codex*100:.1f}%")
+            wr_codex, _ = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="codex7")
+            print(f"Codex 7         : Win Rate: {wr_codex*100:.1f}%")
             
-            win_rate_neural, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="neural")
-            print(f"Neural Only     : Win Rate: {win_rate_neural*100:.1f}%")
+            wr_neural, _ = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="neural")
+            print(f"Neural Only     : Win Rate: {wr_neural*100:.1f}%")
             
-            win_rate_mask, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="mask")
-            print(f"Neural + Mask   : Win Rate: {win_rate_mask*100:.1f}%")
+            wr_mask, _ = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="mask")
+            print(f"Neural + Mask   : Win Rate: {wr_mask*100:.1f}%")
             
-            win_rate_fallback, fallback_rate = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="fallback")
-            print(f"Neural+Mask+Fall: Win Rate: {win_rate_fallback*100:.1f}%, Fallback Rate: {fallback_rate*100:.1f}%")
+            wr_fallback, fallback_rate = evaluate_agent_win_rate(model, device, current_max_steps, num_matches=eval_matches, agent_type="fallback")
+            print(f"Neural+Mask+Fall: Win Rate: {wr_fallback*100:.1f}%, Fallback Rate: {fallback_rate*100:.1f}%")
             
-            print(f"(Threshold: {stage_threshold*100:.1f}%)")
-
-            eval_score = max(win_rate_mask, win_rate_fallback) - 0.25 * fallback_rate
+            eval_score = max(wr_mask, wr_fallback) - 0.25 * fallback_rate
             if eval_score > best_eval_score:
                 best_eval_score = eval_score
                 Path(args.best_checkpoint).parent.mkdir(parents=True, exist_ok=True)
-                torch.save({"model_state_dict": model.state_dict(), "stage": stage, "update": update, "eval_score": eval_score}, args.best_checkpoint)
-                print(f"-> Saved best checkpoint to {args.best_checkpoint} (score={eval_score:.3f})")
-
-            stage_ckpt = Path(args.stage_checkpoint_dir) / f"stage{stage}_update{update}.pt"
-            torch.save({"model_state_dict": model.state_dict(), "stage": stage, "update": update, "eval_score": eval_score}, stage_ckpt)
-            print(f"-> Saved stage checkpoint: {stage_ckpt}")
-
-            if int(getattr(args, "fixed_stage", -1)) < 0 and stage < 7 and (win_rate_mask >= stage_threshold or win_rate_fallback >= stage_threshold) and (win_rate_mask > win_rate_codex or win_rate_fallback > win_rate_codex):
-                stage += 1
-                print(f"-> ADVANCED TO STAGE {stage}!")
-            else:
-                print("-> Continuing current stage...")
-
-        print(f"PPO Update {update + 1}/{args.ppo_updates} | Curriculum Stage {stage}")
+                torch.save({"model_state_dict": model.state_dict(), "pct": pct, "update": update, "eval_score": eval_score}, args.best_checkpoint)
+                print(f"-> Saved best checkpoint (score={eval_score:.3f})")
+            
+            for mp in milestone_pcts:
+                if mp not in saved_milestones and pct >= mp - 0.005:
+                    saved_milestones.add(mp)
+                    ms_name = f"milestone_{mp*100:.0f}pct"
+                    ms_path = milestone_dir / f"{ms_name}_update{update}.pt"
+                    torch.save({"model_state_dict": model.state_dict(), "pct": pct, "update": update, "eval_score": eval_score}, ms_path)
+                    print(f"-> Saved milestone: {ms_path}")
+        
+        print(f"PPO {update+1}/{total_updates} | {pct*100:.1f}% | lr={current_lr:.2e} ent={current_ent:.4f} horizon={current_horizon} max_steps={current_max_steps}")
+        
         trajectories = collect_ppo_rollout(
             model,
             device=device,
-            horizon=args.ppo_horizon,
+            horizon=current_horizon,
             envs=args.ppo_envs_per_update,
-            max_steps=stage_max_steps,
+            max_steps=current_max_steps,
             seed=args.seed + 10000 * update,
             snapshot_models=snapshot_models,
-            stage=stage,
+            update=update,
+            total_updates=total_updates,
+            opponent_schedule=opponent_schedule,
+            win_counters=win_counters,
         )
         if not trajectories:
-            print(f"PPO {update + 1}/{args.ppo_updates}: empty rollout")
+            print(f"PPO {update + 1}/{total_updates}: empty rollout")
             continue
 
         all_advantages = []
@@ -1224,7 +1325,6 @@ def train_ppo(model, device, args):
             adv, ret = compute_gae(traj.rewards, traj.dones, traj.values, args.gamma, args.gae_lambda)
             all_advantages.append(adv)
             all_returns.append(ret)
-            
             flat_batch.spatial.extend(traj.spatial)
             flat_batch.scalar.extend(traj.scalar)
             flat_batch.masks.extend(traj.masks)
@@ -1259,12 +1359,12 @@ def train_ppo(model, device, args):
                 pg2 = torch.clamp(ratio, 1 - args.clip_eps, 1 + args.clip_eps) * advantages_t[mb]
                 policy_loss = -torch.min(pg1, pg2).mean()
                 value_loss = F.mse_loss(values, returns_t[mb])
-                loss = policy_loss + args.vf_coef * value_loss - args.ent_coef * dist.entropy().mean()
+                loss = policy_loss + args.vf_coef * value_loss - current_ent * dist.entropy().mean()
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 opt.step()
-        print(f"PPO {update + 1}/{args.ppo_updates}: reward_mean={np.mean(flat_batch.rewards):.3f}, samples={len(actions)}")
+        print(f"PPO {update+1}/{total_updates}: reward_mean={np.mean(flat_batch.rewards):.3f}, samples={len(actions)}")
         
         # Save snapshot
         if (update + 1) % max(1, int(getattr(args, "snapshot_interval", 10))) == 0:
@@ -1272,9 +1372,22 @@ def train_ppo(model, device, args):
             snap.load_state_dict({k: v.detach().clone() for k, v in model.state_dict().items()})
             snap.eval()
             snapshot_models.append(snap)
-            snap_path = Path(args.stage_checkpoint_dir) / f"snapshot_stage{stage}_update{update+1}.pt"
-            torch.save({"model_state_dict": model.state_dict(), "stage": stage, "update": update + 1}, snap_path)
-            print(f"Saved snapshot checkpoint: {snap_path}")
+            snap_path = milestone_dir / f"snapshot_update{update+1}.pt"
+            torch.save({"model_state_dict": model.state_dict(), "pct": pct, "update": update + 1}, snap_path)
+            print(f"Saved snapshot: {snap_path}")
+        
+        # Adaptive priority adjustment
+        if (update + 1) % max(1, eval_interval * 2) == 0:
+            for entry in opponent_schedule:
+                stats = win_counters.get(entry["agent"], {"wins": 0, "total": 0})
+                if stats["total"] >= 10:
+                    wr = stats["wins"] / stats["total"]
+                    if wr > 0.75:
+                        entry["priority"] = max(2, entry["priority"] * 0.85)
+                        print(f"Adapt: reduced {entry.get('label', entry['agent'])} priority to {entry['priority']:.1f} (WR={wr:.2f})")
+                    elif wr < 0.35:
+                        entry["priority"] = min(20, entry["priority"] * 1.15)
+                        print(f"Adapt: increased {entry.get('label', entry['agent'])} priority to {entry['priority']:.1f} (WR={wr:.2f})")
 
 
 EXPORT_AGENT_TEMPLATE = """from collections import deque
@@ -1758,13 +1871,19 @@ def build_arg_parser():
     parser.add_argument("--ppo-horizon", type=int, default=256)
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--ppo-minibatch-size", type=int, default=512)
-    parser.add_argument("--ppo-lr", type=float, default=2.5e-4)
-    parser.add_argument("--eval-interval", type=int, default=5, help="PPO updates between curriculum evaluations")
-    parser.add_argument("--eval-matches", type=int, default=10, help="Matches per PPO evaluation probe")
+    parser.add_argument("--ppo-lr", type=float, default=2.5e-4, help="Default PPO LR (used if start/end not set)")
+    parser.add_argument("--ppo-lr-start", type=float, default=None, help="PPO LR at 0% training progress")
+    parser.add_argument("--ppo-lr-end", type=float, default=None, help="PPO LR at 100% training progress")
+    parser.add_argument("--ppo-ent-start", type=float, default=None, help="Entropy coef at 0% training progress")
+    parser.add_argument("--ppo-ent-end", type=float, default=None, help="Entropy coef at 100% training progress")
+    parser.add_argument("--ppo-horizon-start", type=int, default=None, help="PPO horizon at 0% training progress")
+    parser.add_argument("--ppo-horizon-end", type=int, default=None, help="PPO horizon at 100% training progress")
+    parser.add_argument("--max-steps-start", type=int, default=None, help="Episode max_steps at 0% training progress")
+    parser.add_argument("--max-steps-end", type=int, default=None, help="Episode max_steps at 100% training progress")
+    parser.add_argument("--eval-interval", type=int, default=10, help="PPO updates between evaluations")
+    parser.add_argument("--eval-matches", type=int, default=12, help="Matches per PPO evaluation probe")
     parser.add_argument("--snapshot-interval", type=int, default=10, help="PPO updates between self-play snapshots")
-    parser.add_argument("--fixed-stage", type=int, default=-1, help="Train only this curriculum stage; no auto-advance when >=0")
-    parser.add_argument("--init-stage", type=int, default=0, help="Initial curriculum stage for auto mode")
-    parser.add_argument("--stage-checkpoint-dir", default="checkpoints/stages", help="Directory for per-stage PPO checkpoints")
+    parser.add_argument("--stage-checkpoint-dir", default="checkpoints/milestones", help="Directory for milestone checkpoints")
     parser.add_argument("--best-checkpoint", default="checkpoints/best_hybrid_bc_ppo.pt", help="Best PPO checkpoint selected by eval score")
     parser.add_argument("--bc-unweighted", action="store_true", help="Disable mild inverse-frequency BC action weighting")
     parser.add_argument("--torch-threads", type=int, default=1, help="CPU torch threads; 1 is much faster in Colab/CPU smoke runs")
@@ -1774,8 +1893,7 @@ def build_arg_parser():
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--ent-coef", type=float, default=0.015)
     parser.add_argument("--grad-clip", type=float, default=0.5)
-    parser.add_argument("--curriculum-config", type=str, default="", help="Path to JSON file overriding CURRICULUM_CONFIG")
-    parser.add_argument("--overrides", type=str, default="", help="Path to overrides JSON (opponent_pools, etc.)")
+    parser.add_argument("--overrides", type=str, default="", help="Path to overrides JSON (opponent_schedule, reward, etc.)")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--save-checkpoint", default="checkpoints/hybrid_bc_ppo.pt")
     parser.add_argument("--export-dir", default="exports/hybrid_ppo_agent")
@@ -1788,27 +1906,20 @@ def main(argv=None):
     if getattr(args, "torch_threads", 0):
         torch.set_num_threads(max(1, int(args.torch_threads)))
     
-    if args.curriculum_config:
-        global CURRICULUM_CONFIG
-        with open(args.curriculum_config, "r") as f:
-            data = json.load(f)
-        CURRICULUM_CONFIG.clear()
-        CURRICULUM_CONFIG.update({int(k): v for k, v in data.items()})
-        print(f"Loaded curriculum config from {args.curriculum_config}")
-    
     if args.overrides:
         overrides_path = Path(args.overrides)
         if not overrides_path.is_absolute():
             overrides_path = ROOT / overrides_path
         if overrides_path.exists():
             overrides = json.loads(overrides_path.read_text())
-            pool_overrides = overrides.get("opponent_pools", {})
-            for s, pool in pool_overrides.items():
-                STAGE_OPPONENT_POOLS[int(s)] = pool
-                print(f"Override opponent pool stage {s}: {pool}")
+            if "hyperparam" in overrides:
+                hp = overrides["hyperparam"]
+                for k, v in hp.items():
+                    if hasattr(args, k):
+                        setattr(args, k, v)
+                        print(f"Override hyperparam {k}={v}")
         else:
             print(f"Warning: overrides file {overrides_path} not found")
-        
     seed_everything(args.seed)
     device = torch.device(args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     print("Device:", device)

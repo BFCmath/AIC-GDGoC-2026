@@ -67,4 +67,6 @@ def test_curriculum_configs_exist():
 def test_notebook_reflects_new_layout():
     text = "\n".join(_sources())
     assert "docs/patches" in text
-    assert "configs/curriculum_stagewise_v2.json" in text
+    assert "Continuous Curriculum" in text
+    assert "opponent_schedule" in text
+    assert "MILESTONE_DIR" in text
