@@ -918,9 +918,15 @@ def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, c
         else:
             avg_strength = 1.0
         
-        if rank_val == 0:
+        winners = [i for i, r in enumerate(ranks) if r == 0]
+        unique_win = rank_val == 0 and len(winners) == 1
+        shared_best = rank_val == 0 and len(winners) > 1
+
+        if unique_win:
             offset = reward_config.get("win_strength_offset", 0.5)
             terminal = reward_config["rank_rewards"][0] * (offset + avg_strength)
+        elif shared_best:
+            terminal = 2.0 * avg_strength
         elif rank_val == 1:
             terminal = reward_config["rank_rewards"][1]
         else:
@@ -943,6 +949,7 @@ class PPOBatch:
     rewards: list
     dones: list
     values: list
+    last_value: float = 0.0
 
     def append(self, spatial, scalar, mask, action, logprob, reward, done, value):
         self.spatial.append(spatial)
@@ -1020,7 +1027,7 @@ class NeuralSafeAgent:
         return int(action.item())
 
 
-def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_models=None, update=0, total_updates=1, opponent_schedule=None, win_counters=None):
+def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_models=None, update=0, total_updates=1, opponent_schedule=None, win_counters=None, reward_config=None):
     if opponent_schedule is None:
         opponent_schedule = OPPONENT_SCHEDULE
     trajectories = []
@@ -1106,6 +1113,7 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
                 prev_visited_positions=prev_visited_positions,
                 death_steps=death_steps,
                 opponent_strengths=opponent_strengths,
+                reward_config=reward_config,
             )
             
             if env.players[control_id] is not None and getattr(env.players[control_id], "alive", False):
@@ -1120,6 +1128,14 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             if done:
                 break
         
+        if batch.actions and not done:
+            with torch.no_grad():
+                s_last, a_last = encode_observation(obs, control_id, step, max_steps=max_steps)
+                s_t = torch.from_numpy(s_last).unsqueeze(0).to(device)
+                a_t = torch.from_numpy(a_last).unsqueeze(0).to(device)
+                _, v_last = model(s_t, a_t)
+                batch.last_value = float(v_last.item())
+        
         if win_counters is not None and batch.actions:
             ranks = rank_players(env, death_steps=death_steps)
             if ranks[control_id] == 0:
@@ -1133,13 +1149,13 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
     return trajectories
 
 
-def compute_gae(rewards, dones, values, gamma, gae_lambda):
+def compute_gae(rewards, dones, values, gamma, gae_lambda, last_value=0.0):
     rewards = np.asarray(rewards, dtype=np.float32)
     dones = np.asarray(dones, dtype=np.float32)
     values = np.asarray(values, dtype=np.float32)
     advantages = np.zeros_like(rewards)
     last_gae = 0.0
-    next_value = 0.0
+    next_value = float(last_value)
     for tick in reversed(range(len(rewards))):
         nonterminal = 1.0 - dones[tick]
         delta = rewards[tick] + gamma * next_value * nonterminal - values[tick]
@@ -1312,6 +1328,7 @@ def train_ppo(model, device, args):
             total_updates=total_updates,
             opponent_schedule=opponent_schedule,
             win_counters=win_counters,
+            reward_config=reward_config,
         )
         if not trajectories:
             print(f"PPO {update + 1}/{total_updates}: empty rollout")
@@ -1322,7 +1339,7 @@ def train_ppo(model, device, args):
         flat_batch = PPOBatch.empty()
         
         for traj in trajectories:
-            adv, ret = compute_gae(traj.rewards, traj.dones, traj.values, args.gamma, args.gae_lambda)
+            adv, ret = compute_gae(traj.rewards, traj.dones, traj.values, args.gamma, args.gae_lambda, last_value=traj.last_value)
             all_advantages.append(adv)
             all_returns.append(ret)
             flat_batch.spatial.extend(traj.spatial)

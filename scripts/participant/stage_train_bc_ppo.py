@@ -92,7 +92,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=86)
     ap.add_argument("--torch-threads", type=int, default=1)
     ap.add_argument("--skip-bc", action="store_true")
+    ap.add_argument("--resume", default="", help="Checkpoint to resume PPO from (skips BC)")
     ap.add_argument("--export-dir", default="exports/stagewise_hybrid_agent")
+    ap.add_argument("--eval-matches", type=int, default=None, help="Override eval matches for PPO")
     ap.add_argument("--overrides", help="Path to overrides JSON (opponent_schedule, reward, hyperparam)")
     ap.add_argument("--milestone-dir", default="checkpoints/milestones")
     args = ap.parse_args()
@@ -102,6 +104,9 @@ def main() -> None:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     bc_ckpt = ckpt_dir / "bc.pt"
     final_ckpt = ckpt_dir / "final.pt"
+
+    if args.resume:
+        args.skip_bc = True
 
     if not args.skip_bc:
         run([
@@ -116,10 +121,11 @@ def main() -> None:
     elif not bc_ckpt.exists():
         raise FileNotFoundError(f"--skip-bc requested but {bc_ckpt} does not exist")
 
+    ppo_start_ckpt = Path(args.resume) if args.resume else bc_ckpt
     ppo_flags = [
         sys.executable, "-u", str(TRAIN), "--mode", "ppo", "--device", args.device,
         "--seed", str(args.seed), "--torch-threads", str(args.torch_threads),
-        "--checkpoint", str(bc_ckpt), "--save-checkpoint", str(final_ckpt),
+        "--checkpoint", str(ppo_start_ckpt), "--save-checkpoint", str(final_ckpt),
         "--ppo-updates", str(cfg["ppo_updates"]),
         "--ppo-envs-per-update", str(cfg["ppo_envs"]),
         "--ppo-horizon", str(cfg.get("ppo_horizon_start", 128)),
@@ -135,18 +141,25 @@ def main() -> None:
         "--best-checkpoint", str(ckpt_dir / "best.pt"),
     ] + DEFAULT_PPO_ARGS
 
+    if args.eval_matches is not None:
+        ppo_flags.extend(["--eval-matches", str(args.eval_matches)])
     if args.overrides:
         ppo_flags.extend(["--overrides", args.overrides])
 
     run(ppo_flags)
 
+    export_ckpt = ckpt_dir / "best.pt"
+    if not export_ckpt.exists():
+        export_ckpt = final_ckpt
     run([
         sys.executable, "-u", str(TRAIN), "--mode", "export", "--device", "cpu",
-        "--checkpoint", str(final_ckpt), "--export-dir", args.export_dir,
+        "--checkpoint", str(export_ckpt), "--export-dir", args.export_dir,
     ])
 
     print("\nContinuous curriculum training completed.")
+    print(f"Best checkpoint:  {ckpt_dir / 'best.pt'}")
     print(f"Final checkpoint: {final_ckpt}")
+    print(f"Exported from:    {export_ckpt}")
     print(f"Export folder:    {ROOT / args.export_dir}")
     print(f"Milestones:       {ckpt_dir}")
 
