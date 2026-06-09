@@ -83,8 +83,10 @@ def main() -> None:
     ap.add_argument("--end-stage", type=int, default=7)
     ap.add_argument("--eval-matches", type=int, default=12)
     ap.add_argument("--export-dir", default="exports/stagewise_hybrid_agent")
+    ap.add_argument("--curriculum-config", help="Override curriculum config JSON path")
     args = ap.parse_args()
     cfg = PROFILES[args.profile]
+    curriculum_path = args.curriculum_config or str(ROOT / cfg["curriculum"])
 
     ckpt_dir = ROOT / "checkpoints/stagewise"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +115,7 @@ def main() -> None:
             sys.executable, "-u", str(TRAIN), "--mode", "ppo", "--device", args.device,
             "--seed", str(args.seed + 1000 * stage), "--torch-threads", str(args.torch_threads),
             "--checkpoint", str(current), "--save-checkpoint", str(out),
-            "--curriculum-config", str(ROOT / cfg["curriculum"]),
+            "--curriculum-config", curriculum_path,
             "--fixed-stage", str(stage),
             "--ppo-updates", str(st["updates"]),
             "--ppo-envs-per-update", str(st["envs"]),
