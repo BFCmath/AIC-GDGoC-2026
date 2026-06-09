@@ -118,7 +118,7 @@ def main() -> None:
             "--bc-batch-size", "512", "--bc-lr", "3e-4",
             "--save-checkpoint", str(bc_ckpt),
         ])
-    elif not bc_ckpt.exists():
+    elif not args.resume and not bc_ckpt.exists():
         raise FileNotFoundError(f"--skip-bc requested but {bc_ckpt} does not exist")
 
     ppo_start_ckpt = Path(args.resume) if args.resume else bc_ckpt
