@@ -988,14 +988,14 @@ def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20):
     return float(wins) / num_matches
 
 CURRICULUM_CONFIG = {
-    0: {"max_steps": 100, "win_rate": 0.80},
-    1: {"max_steps": 150, "win_rate": 0.70},
-    2: {"max_steps": 200, "win_rate": 0.60},
-    3: {"max_steps": 250, "win_rate": 0.50},
-    4: {"max_steps": 300, "win_rate": 0.40},
-    5: {"max_steps": 350, "win_rate": 0.40},
-    6: {"max_steps": 400, "win_rate": 0.40},
-    7: {"max_steps": 500, "win_rate": 0.35},
+    0: {"max_steps": 150, "win_rate": 0.80},
+    1: {"max_steps": 150, "win_rate": 0.80},
+    2: {"max_steps": 250, "win_rate": 0.30},
+    3: {"max_steps": 250, "win_rate": 0.30},
+    4: {"max_steps": 350, "win_rate": 0.30},
+    5: {"max_steps": 350, "win_rate": 0.30},
+    6: {"max_steps": 500, "win_rate": 0.30},
+    7: {"max_steps": 500, "win_rate": 0.30},
 }
 
 def train_ppo(model, device, args):
