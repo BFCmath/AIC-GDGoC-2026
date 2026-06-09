@@ -11,6 +11,7 @@ Example quick GPU run:
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -84,9 +85,37 @@ def main() -> None:
     ap.add_argument("--eval-matches", type=int, default=12)
     ap.add_argument("--export-dir", default="exports/stagewise_hybrid_agent")
     ap.add_argument("--curriculum-config", help="Override curriculum config JSON path")
+    ap.add_argument("--overrides", help="Path to overrides JSON (stages, curriculum, etc.)")
     args = ap.parse_args()
     cfg = PROFILES[args.profile]
     curriculum_path = args.curriculum_config or str(ROOT / cfg["curriculum"])
+    
+    if args.overrides:
+        overrides_path = Path(args.overrides)
+        if not overrides_path.is_absolute():
+            overrides_path = ROOT / overrides_path
+        if overrides_path.exists():
+            overrides = json.loads(overrides_path.read_text())
+            stage_overrides = overrides.get("stages", {})
+            for st in cfg["stages"]:
+                key = str(st["stage"])
+                if key in stage_overrides:
+                    st.update(stage_overrides[key])
+                    print(f"Override stage {key}: {stage_overrides[key]}")
+            curr_overrides = overrides.get("curriculum", {})
+            if curr_overrides:
+                base = json.loads(Path(ROOT / cfg["curriculum"]).read_text())
+                for s, vals in curr_overrides.items():
+                    if s in base:
+                        base[s].update(vals)
+                    else:
+                        base[s] = vals
+                custom_path = ROOT / "configs" / "_generated_curriculum.json"
+                custom_path.write_text(json.dumps(base, indent=2))
+                curriculum_path = str(custom_path)
+                print(f"Override curriculum -> {custom_path}")
+        else:
+            print(f"Warning: overrides file {overrides_path} not found")
 
     ckpt_dir = ROOT / "checkpoints/stagewise"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +140,7 @@ def main() -> None:
         if stage < args.start_stage or stage > args.end_stage:
             continue
         out = ckpt_dir / f"stage{stage}.pt"
-        run([
+        ppo_flags = [
             sys.executable, "-u", str(TRAIN), "--mode", "ppo", "--device", args.device,
             "--seed", str(args.seed + 1000 * stage), "--torch-threads", str(args.torch_threads),
             "--checkpoint", str(current), "--save-checkpoint", str(out),
@@ -126,7 +155,10 @@ def main() -> None:
             "--snapshot-interval", "5",
             "--stage-checkpoint-dir", str(ckpt_dir / "snapshots"),
             "--best-checkpoint", str(ckpt_dir / f"best_stage{stage}.pt"),
-        ])
+        ]
+        if args.overrides:
+            ppo_flags.extend(["--overrides", args.overrides])
+        run(ppo_flags)
         current = out
 
     run([

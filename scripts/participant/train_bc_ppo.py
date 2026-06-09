@@ -1775,6 +1775,7 @@ def build_arg_parser():
     parser.add_argument("--ent-coef", type=float, default=0.015)
     parser.add_argument("--grad-clip", type=float, default=0.5)
     parser.add_argument("--curriculum-config", type=str, default="", help="Path to JSON file overriding CURRICULUM_CONFIG")
+    parser.add_argument("--overrides", type=str, default="", help="Path to overrides JSON (opponent_pools, etc.)")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--save-checkpoint", default="checkpoints/hybrid_bc_ppo.pt")
     parser.add_argument("--export-dir", default="exports/hybrid_ppo_agent")
@@ -1794,6 +1795,19 @@ def main(argv=None):
         CURRICULUM_CONFIG.clear()
         CURRICULUM_CONFIG.update({int(k): v for k, v in data.items()})
         print(f"Loaded curriculum config from {args.curriculum_config}")
+    
+    if args.overrides:
+        overrides_path = Path(args.overrides)
+        if not overrides_path.is_absolute():
+            overrides_path = ROOT / overrides_path
+        if overrides_path.exists():
+            overrides = json.loads(overrides_path.read_text())
+            pool_overrides = overrides.get("opponent_pools", {})
+            for s, pool in pool_overrides.items():
+                STAGE_OPPONENT_POOLS[int(s)] = pool
+                print(f"Override opponent pool stage {s}: {pool}")
+        else:
+            print(f"Warning: overrides file {overrides_path} not found")
         
     seed_everything(args.seed)
     device = torch.device(args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu")
