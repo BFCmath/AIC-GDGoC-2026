@@ -1,0 +1,10 @@
+{
+  "0": {"max_steps": 80,  "win_rate": 0.55},
+  "1": {"max_steps": 120, "win_rate": 0.45},
+  "2": {"max_steps": 160, "win_rate": 0.35},
+  "3": {"max_steps": 220, "win_rate": 0.32},
+  "4": {"max_steps": 280, "win_rate": 0.30},
+  "5": {"max_steps": 360, "win_rate": 0.28},
+  "6": {"max_steps": 430, "win_rate": 0.26},
+  "7": {"max_steps": 500, "win_rate": 0.25}
+}

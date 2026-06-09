@@ -1,0 +1,645 @@
+diff --git a/scripts/participant/train_bc_ppo.py b/scripts/participant/train_bc_ppo.py
+--- rl_orig_fixed/AIC-GDGoC-2026-main/scripts/participant/train_bc_ppo.py	2026-06-09 10:46:46.000000000 +0000
++++ rl_work/AIC-GDGoC-2026-main/scripts/participant/train_bc_ppo.py	2026-06-09 10:57:47.111538116 +0000
+@@ -485,7 +485,7 @@
+ 
+ def get_symmetries(spatial, mask, action):
+     # Action remap tables for the 8 dihedral group elements (D4)
+-    # actions: 0=STOP, 1=UP, 2=DOWN, 3=LEFT, 4=RIGHT, 5=BOMB
++    # actions: 0=STOP, 1=LEFT, 2=RIGHT, 3=UP, 4=DOWN, 5=BOMB
+     remap = [
+         [0, 1, 2, 3, 4, 5],  # 0: Identity
+         [0, 4, 3, 1, 2, 5],  # 1: Rotate 90 CW (UP->RIGHT->DOWN->LEFT->UP)
+@@ -494,7 +494,7 @@
+         [0, 1, 2, 4, 3, 5],  # 4: Flip Horizontal (LEFT<->RIGHT)
+         [0, 2, 1, 3, 4, 5],  # 5: Flip Vertical (UP<->DOWN)
+         [0, 3, 4, 1, 2, 5],  # 6: Flip Diagonal (Transpose, UP<->LEFT, DOWN<->RIGHT)
+-        [0, 4, 3, 2, 1, 5],  # 7: Flip Anti-diagonal (Transpose + Flip, UP<->RIGHT, DOWN<->LEFT)
++        [0, 4, 3, 2, 1, 5],  # 7: Flip anti-diagonal: (x,y)->(N-1-y,N-1-x)
+     ]
+     
+     symmetries = []
+@@ -514,7 +514,10 @@
+         elif sym_idx == 6:
+             sp = np.transpose(spatial, axes=(0, 2, 1))
+         elif sym_idx == 7:
+-            sp = np.flip(np.transpose(spatial, axes=(0, 2, 1)), axis=1)
++            # True anti-diagonal reflection.  The previous implementation only
++            # flipped one axis after transpose, which made the spatial transform
++            # inconsistent with the action remap and injected wrong BC labels.
++            sp = np.flip(np.transpose(spatial, axes=(0, 2, 1)), axis=(1, 2))
+             
+         m_table = remap[sym_idx]
+         act_sym = m_table[action]
+@@ -526,10 +529,11 @@
+     return symmetries
+ 
+ 
+-def collect_expert_dataset(num_matches, max_steps, seed):
++def collect_expert_dataset(num_matches, max_steps, seed, accept_safe_trap_bombs=True):
+     env = BomberEnv(max_steps=max_steps, seed=seed)
+     spatial_rows, scalar_rows, mask_rows, action_rows = [], [], [], []
+     skipped = 0
++    action_hist = {a: 0 for a in range(ACTIONS)}
+     for match in range(num_matches):
+         specs = [random.choice(EXPERT_SAMPLE_POOL) for _ in range(4)]
+         experts = [make_agent(specs[i], i) for i in range(4)]
+@@ -545,30 +549,51 @@
+                 actions.append(action)
+                 if int(obs["players"][agent_id][2]) != 1:
+                     continue
+-                mask = legal_action_mask(obs, agent_id, veto_bombs=True)
++
++                # BC should imitate strong agents' trap/farming bombs when they
++                # are legal and escapable.  The previous veto_bombs=True mask
++                # rejected every bomb that did not immediately hit a box/enemy,
++                # which deletes many pressure/trap examples from codex 4/7/8.
++                mask = legal_action_mask(obs, agent_id, veto_bombs=not accept_safe_trap_bombs)
++                if accept_safe_trap_bombs:
++                    mask = legal_action_mask(obs, agent_id, veto_bombs=False)
++                    if action == 5 and not can_escape_after_bomb(obs, agent_id):
++                        skipped += 1
++                        continue
+                 if not mask[action]:
+                     skipped += 1
+                     continue
+                 spatial, scalar = encode_observation(obs, agent_id, step, max_steps=max_steps)
+-                
+-                # Apply 8-fold symmetries data augmentation
++
++                # Apply 8-fold D4 symmetries data augmentation.
+                 for sp, msk, act in get_symmetries(spatial, mask, action):
+-                    spatial_rows.append(sp)
++                    spatial_rows.append(np.ascontiguousarray(sp))
+                     scalar_rows.append(scalar)
+                     mask_rows.append(msk)
+                     action_rows.append(act)
++                    action_hist[int(act)] += 1
+             obs, terminated, truncated = env.step(actions)
+             if terminated or truncated:
+                 break
+         if (match + 1) % max(1, num_matches // 10) == 0:
+-            print(f"BC collection {match + 1}/{num_matches}: {len(action_rows)} samples, skipped={skipped}")
++            hist = ", ".join(f"{a}:{action_hist[a]}" for a in range(ACTIONS))
++            print(f"BC collection {match + 1}/{num_matches}: {len(action_rows)} samples, skipped={skipped}, hist=[{hist}]")
+     return ExpertDataset(spatial_rows, scalar_rows, mask_rows, action_rows)
+ 
+-
+-def train_behavior_cloning(model, dataset, device, epochs, batch_size, lr, grad_clip):
++def train_behavior_cloning(model, dataset, device, epochs, batch_size, lr, grad_clip, weighted_loss=True):
+     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
++    action_weight = None
++    if weighted_loss and len(dataset) > 0:
++        counts = torch.bincount(dataset.actions, minlength=ACTIONS).float()
++        inv = counts.sum() / torch.clamp(counts, min=1.0)
++        # Keep the correction mild: enough to prevent STOP/move dominance, not
++        # enough to make rare bombs explode in probability.
++        action_weight = torch.sqrt(inv / inv.mean()).to(device)
++        print("BC action weights:", [round(float(x), 3) for x in action_weight.cpu()])
+     model.train()
++    best_acc = -1.0
++    best_state = None
+     for epoch in range(epochs):
+         total_loss, total_correct, total_seen = 0.0, 0, 0
+         for spatial, scalar, masks, actions in loader:
+@@ -576,7 +601,7 @@
+             masks, actions = masks.to(device), actions.to(device)
+             logits, _ = model(spatial, scalar)
+             logits = masked_logits(logits, masks)
+-            loss = F.cross_entropy(logits, actions)
++            loss = F.cross_entropy(logits, actions, weight=action_weight)
+             opt.zero_grad(set_to_none=True)
+             loss.backward()
+             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+@@ -584,8 +609,14 @@
+             total_loss += float(loss.item()) * len(actions)
+             total_correct += int((logits.argmax(dim=-1) == actions).sum().item())
+             total_seen += len(actions)
+-        print(f"BC epoch {epoch + 1}/{epochs}: loss={total_loss / max(total_seen, 1):.4f}, acc={total_correct / max(total_seen, 1):.3f}")
+-
++        acc = total_correct / max(total_seen, 1)
++        if acc > best_acc:
++            best_acc = acc
++            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
++        print(f"BC epoch {epoch + 1}/{epochs}: loss={total_loss / max(total_seen, 1):.4f}, acc={acc:.3f}")
++    if best_state is not None:
++        model.load_state_dict(best_state)
++        print(f"Loaded best BC epoch by train accuracy: acc={best_acc:.3f}")
+ 
+ def sample_masked_action(model, spatial, scalar, mask, deterministic=False):
+     logits, value = model(spatial, scalar)
+@@ -796,8 +827,30 @@
+     if action == 0 and not in_prev_danger:
+         reward -= 0.02
+ 
++    # BTC tie-break shaping.  Most short/local curriculum games end at the step
++    # limit, so the policy must learn kills > boxes > items > bombs rather than
++    # pure survival.  This is deliberately small per step and larger at terminal.
++    if prev_stats is not None and cur_stats is not None:
++        bombs_diff = cur_stats["bombs"] - prev_stats["bombs"]
++        if bombs_diff > 0 and action == 5:
++            reward += 0.04 * bombs_diff
++
+     # Terminal rank rewards
+     if done:
++        # Add a small normalized terminal stat lead bonus aligned with BTC
++        # truncated-game tie-breakers.
++        try:
++            me = env.players[agent_id].stats
++            opp_stats = [env.players[i].stats for i in range(4) if i != agent_id]
++            stat_bonus = 0.0
++            for opp in opp_stats:
++                stat_bonus += 0.35 * np.sign(me["kills"] - opp["kills"])
++                stat_bonus += 0.08 * np.sign(me["boxes"] - opp["boxes"])
++                stat_bonus += 0.12 * np.sign(me["items"] - opp["items"])
++                stat_bonus += 0.02 * np.sign(me["bombs"] - opp["bombs"])
++            reward += float(stat_bonus)
++        except Exception:
++            pass
+         ranks = rank_players(env, death_steps=death_steps)
+         rank_val = ranks[agent_id]
+         
+@@ -1102,8 +1155,11 @@
+     initial_snap.eval()
+     snapshot_models.append(initial_snap)
+     
+-    stage = 0
++    stage = int(getattr(args, "fixed_stage", -1)) if int(getattr(args, "fixed_stage", -1)) >= 0 else int(getattr(args, "init_stage", 0))
+     eval_interval = max(1, int(getattr(args, "eval_interval", 5)))
++    eval_matches = max(1, int(getattr(args, "eval_matches", 10)))
++    best_eval_score = -1e9
++    Path(getattr(args, "stage_checkpoint_dir", "checkpoints/stages")).mkdir(parents=True, exist_ok=True)
+     
+     for update in range(args.ppo_updates):
+         stage_cfg = CURRICULUM_CONFIG.get(stage, {"max_steps": args.max_steps, "win_rate": 0.40})
+@@ -1111,28 +1167,39 @@
+         stage_threshold = stage_cfg["win_rate"]
+         
+         # Evaluate and potentially advance stage
+-        if update > 0 and update % eval_interval == 0 and stage < 7:
++        if update > 0 and update % eval_interval == 0:
+             print(f"--- Evaluating Stage {stage} ---")
+             
+-            win_rate_codex, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="codex7")
++            win_rate_codex, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="codex7")
+             print(f"Codex 7         : Win Rate: {win_rate_codex*100:.1f}%")
+             
+-            win_rate_neural, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="neural")
++            win_rate_neural, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="neural")
+             print(f"Neural Only     : Win Rate: {win_rate_neural*100:.1f}%")
+             
+-            win_rate_mask, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="mask")
++            win_rate_mask, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="mask")
+             print(f"Neural + Mask   : Win Rate: {win_rate_mask*100:.1f}%")
+             
+-            win_rate_fallback, fallback_rate = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="fallback")
++            win_rate_fallback, fallback_rate = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="fallback")
+             print(f"Neural+Mask+Fall: Win Rate: {win_rate_fallback*100:.1f}%, Fallback Rate: {fallback_rate*100:.1f}%")
+             
+             print(f"(Threshold: {stage_threshold*100:.1f}%)")
+-            
+-            if (win_rate_mask >= stage_threshold or win_rate_fallback >= stage_threshold) and (win_rate_mask > win_rate_codex or win_rate_fallback > win_rate_codex):
++
++            eval_score = max(win_rate_mask, win_rate_fallback) - 0.25 * fallback_rate
++            if eval_score > best_eval_score:
++                best_eval_score = eval_score
++                Path(args.best_checkpoint).parent.mkdir(parents=True, exist_ok=True)
++                torch.save({"model_state_dict": model.state_dict(), "stage": stage, "update": update, "eval_score": eval_score}, args.best_checkpoint)
++                print(f"-> Saved best checkpoint to {args.best_checkpoint} (score={eval_score:.3f})")
++
++            stage_ckpt = Path(args.stage_checkpoint_dir) / f"stage{stage}_update{update}.pt"
++            torch.save({"model_state_dict": model.state_dict(), "stage": stage, "update": update, "eval_score": eval_score}, stage_ckpt)
++            print(f"-> Saved stage checkpoint: {stage_ckpt}")
++
++            if int(getattr(args, "fixed_stage", -1)) < 0 and stage < 7 and (win_rate_mask >= stage_threshold or win_rate_fallback >= stage_threshold) and (win_rate_mask > win_rate_codex or win_rate_fallback > win_rate_codex):
+                 stage += 1
+                 print(f"-> ADVANCED TO STAGE {stage}!")
+             else:
+-                print("-> Retrying stage...")
++                print("-> Continuing current stage...")
+ 
+         print(f"PPO Update {update + 1}/{args.ppo_updates} | Curriculum Stage {stage}")
+         trajectories = collect_ppo_rollout(
+@@ -1205,6 +1272,9 @@
+             snap.load_state_dict({k: v.detach().clone() for k, v in model.state_dict().items()})
+             snap.eval()
+             snapshot_models.append(snap)
++            snap_path = Path(args.stage_checkpoint_dir) / f"snapshot_stage{stage}_update{update+1}.pt"
++            torch.save({"model_state_dict": model.state_dict(), "stage": stage, "update": update + 1}, snap_path)
++            print(f"Saved snapshot checkpoint: {snap_path}")
+ 
+ 
+ EXPORT_AGENT_TEMPLATE = """from collections import deque
+@@ -1212,6 +1282,7 @@
+ import numpy as np
+ import torch
+ import torch.nn as nn
++torch.set_num_threads(1)
+ 
+ ACTIONS = 6
+ BOARD = 13
+@@ -1440,14 +1511,18 @@
+         self.fallback_agent = None
+         try:
+             import importlib.util
+-            for fname in ("4.py", "7.py", "8.py"):
++            for fname in ("8.py", "7.py", "4.py"):
+                 fallback_path = Path(__file__).parent / fname
+                 if fallback_path.exists():
+                     spec = importlib.util.spec_from_file_location(f"fallback_teacher_{fname}_{self.agent_id}", fallback_path)
+                     module = importlib.util.module_from_spec(spec)
+                     spec.loader.exec_module(module)
+                     agent = module.Agent(self.agent_id)
+-                    self.teacher_agents.append(agent)
++                    # Prior reflects local ladder strength in the current repo: 8 is
++                    # generally strongest, then 7/4.  The prior is only a tiny
++                    # tie-break; the safety/tactical score still dominates.
++                    prior = {"8.py": 0.10, "7.py": 0.05, "4.py": 0.00}.get(fname, 0.0)
++                    self.teacher_agents.append((agent, prior))
+                     if self.fallback_agent is None:
+                         self.fallback_agent = agent
+         except Exception:
+@@ -1542,7 +1617,11 @@
+     def _teacher_action(self, obs):
+         best_action, best_score = 0, -1e18
+         counts = {}
+-        for teacher in self.teacher_agents:
++        for entry in self.teacher_agents:
++            if isinstance(entry, tuple):
++                teacher, prior = entry
++            else:
++                teacher, prior = entry, 0.0
+             try:
+                 a = int(teacher.act(obs))
+             except Exception:
+@@ -1550,7 +1629,7 @@
+             if not (0 <= a < ACTIONS):
+                 continue
+             counts[a] = counts.get(a, 0) + 1
+-            score = self._action_score(obs, a) + 0.04 * counts[a]
++            score = self._action_score(obs, a) + prior + 0.04 * counts[a]
+             if score > best_score:
+                 best_action, best_score = a, score
+         if best_score <= -1e17 and self.fallback_agent is not None:
+@@ -1582,7 +1661,10 @@
+ 
+             neural_score = self._action_score(obs, neural_action)
+             self.step_count += 1
+-            if neural_prob >= 0.55 and neural_score >= teacher_score + 0.20:
++            # Conservative gate: until PPO is deeply trained, the neural policy is
++            # mostly a tactical specialist.  Let it override the teacher league
++            # only when both probability and independent tactical score agree.
++            if neural_prob >= 0.72 and neural_score >= teacher_score + 0.35:
+                 return neural_action if 0 <= neural_action < ACTIONS else 0
+             return teacher_action if 0 <= teacher_action < ACTIONS else 0
+         except Exception:
+@@ -1678,7 +1760,13 @@
+     parser.add_argument("--ppo-minibatch-size", type=int, default=512)
+     parser.add_argument("--ppo-lr", type=float, default=2.5e-4)
+     parser.add_argument("--eval-interval", type=int, default=5, help="PPO updates between curriculum evaluations")
++    parser.add_argument("--eval-matches", type=int, default=10, help="Matches per PPO evaluation probe")
+     parser.add_argument("--snapshot-interval", type=int, default=10, help="PPO updates between self-play snapshots")
++    parser.add_argument("--fixed-stage", type=int, default=-1, help="Train only this curriculum stage; no auto-advance when >=0")
++    parser.add_argument("--init-stage", type=int, default=0, help="Initial curriculum stage for auto mode")
++    parser.add_argument("--stage-checkpoint-dir", default="checkpoints/stages", help="Directory for per-stage PPO checkpoints")
++    parser.add_argument("--best-checkpoint", default="checkpoints/best_hybrid_bc_ppo.pt", help="Best PPO checkpoint selected by eval score")
++    parser.add_argument("--bc-unweighted", action="store_true", help="Disable mild inverse-frequency BC action weighting")
+     parser.add_argument("--torch-threads", type=int, default=1, help="CPU torch threads; 1 is much faster in Colab/CPU smoke runs")
+     parser.add_argument("--gamma", type=float, default=0.995)
+     parser.add_argument("--gae-lambda", type=float, default=0.95)
+@@ -1717,7 +1805,7 @@
+ 
+     if args.mode in {"bc", "full"}:
+         dataset = collect_expert_dataset(args.bc_matches, args.max_steps, args.seed)
+-        train_behavior_cloning(model, dataset, device, args.bc_epochs, args.bc_batch_size, args.bc_lr, args.grad_clip)
++        train_behavior_cloning(model, dataset, device, args.bc_epochs, args.bc_batch_size, args.bc_lr, args.grad_clip, weighted_loss=not args.bc_unweighted)
+         Path(args.save_checkpoint).parent.mkdir(parents=True, exist_ok=True)
+         torch.save({"model_state_dict": model.state_dict()}, args.save_checkpoint)
+         print(f"Saved checkpoint to {args.save_checkpoint}")
+diff --git a/scripts/participant/stage_train_bc_ppo.py b/scripts/participant/stage_train_bc_ppo.py
+--- /dev/null	2026-06-09 10:33:04.837313627 +0000
++++ rl_work/AIC-GDGoC-2026-main/scripts/participant/stage_train_bc_ppo.py	2026-06-09 10:54:57.445562821 +0000
+@@ -0,0 +1,141 @@
++"""Stage-wise BC+PPO training driver for Kaggle/Colab.
++
++This is a practical orchestrator around train_bc_ppo.py.  It stores a BC
++checkpoint, then trains fixed curriculum stages one by one.  Each stage can use
++its own PPO LR/entropy/update budget and writes stage checkpoints so you can
++resume from the best observed stage.
++
++Example quick GPU run:
++    python scripts/participant/stage_train_bc_ppo.py --device cuda --profile kaggle_medium
++"""
++from __future__ import annotations
++
++import argparse
++import subprocess
++import sys
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[2]
++TRAIN = ROOT / "scripts/participant/train_bc_ppo.py"
++
++PROFILES = {
++    # Fast smoke: intended for CPU/sandbox debugging.
++    "smoke": {
++        "bc_matches": 1,
++        "bc_epochs": 1,
++        "bc_max_steps": 40,
++        "curriculum": "curriculum_sandbox_stagewise.json",
++        "stages": [
++            {"stage": 0, "updates": 2, "envs": 2, "horizon": 16, "lr": 3.0e-4, "ent": 0.020},
++            {"stage": 1, "updates": 2, "envs": 2, "horizon": 16, "lr": 2.5e-4, "ent": 0.018},
++        ],
++    },
++    # Reasonable first Kaggle pass, usually minutes rather than hours.
++    "kaggle_medium": {
++        "bc_matches": 50,
++        "bc_epochs": 28,
++        "bc_max_steps": 220,
++        "curriculum": "curriculum_stagewise_v2.json",
++        "stages": [
++            {"stage": 0, "updates": 30, "envs": 16, "horizon": 128, "lr": 3.0e-4, "ent": 0.020},
++            {"stage": 1, "updates": 40, "envs": 16, "horizon": 128, "lr": 2.5e-4, "ent": 0.018},
++            {"stage": 2, "updates": 50, "envs": 16, "horizon": 160, "lr": 2.0e-4, "ent": 0.016},
++            {"stage": 3, "updates": 60, "envs": 16, "horizon": 192, "lr": 1.6e-4, "ent": 0.014},
++            {"stage": 4, "updates": 70, "envs": 16, "horizon": 224, "lr": 1.2e-4, "ent": 0.012},
++            {"stage": 5, "updates": 80, "envs": 16, "horizon": 256, "lr": 1.0e-4, "ent": 0.010},
++            {"stage": 6, "updates": 90, "envs": 16, "horizon": 256, "lr": 8.0e-5, "ent": 0.008},
++            {"stage": 7, "updates": 120, "envs": 16, "horizon": 256, "lr": 6.0e-5, "ent": 0.006},
++        ],
++    },
++    # Longer run for 2xT4/P100.  Use when the medium run is stable.
++    "kaggle_long": {
++        "bc_matches": 120,
++        "bc_epochs": 45,
++        "bc_max_steps": 300,
++        "curriculum": "curriculum_stagewise_v2.json",
++        "stages": [
++            {"stage": 0, "updates": 60, "envs": 24, "horizon": 160, "lr": 3.0e-4, "ent": 0.020},
++            {"stage": 1, "updates": 80, "envs": 24, "horizon": 192, "lr": 2.5e-4, "ent": 0.018},
++            {"stage": 2, "updates": 100, "envs": 24, "horizon": 224, "lr": 2.0e-4, "ent": 0.015},
++            {"stage": 3, "updates": 120, "envs": 24, "horizon": 256, "lr": 1.5e-4, "ent": 0.013},
++            {"stage": 4, "updates": 140, "envs": 24, "horizon": 256, "lr": 1.2e-4, "ent": 0.011},
++            {"stage": 5, "updates": 160, "envs": 24, "horizon": 320, "lr": 9.0e-5, "ent": 0.009},
++            {"stage": 6, "updates": 180, "envs": 24, "horizon": 320, "lr": 7.0e-5, "ent": 0.007},
++            {"stage": 7, "updates": 240, "envs": 24, "horizon": 384, "lr": 5.0e-5, "ent": 0.005},
++        ],
++    },
++}
++
++
++def run(cmd: list[str]) -> None:
++    print("\n$", " ".join(cmd), flush=True)
++    subprocess.run(cmd, cwd=ROOT, check=True)
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--profile", choices=PROFILES, default="kaggle_medium")
++    ap.add_argument("--device", default="cuda")
++    ap.add_argument("--seed", type=int, default=86)
++    ap.add_argument("--torch-threads", type=int, default=1)
++    ap.add_argument("--skip-bc", action="store_true")
++    ap.add_argument("--start-stage", type=int, default=0)
++    ap.add_argument("--end-stage", type=int, default=7)
++    ap.add_argument("--eval-matches", type=int, default=12)
++    ap.add_argument("--export-dir", default="exports/stagewise_hybrid_agent")
++    args = ap.parse_args()
++    cfg = PROFILES[args.profile]
++
++    ckpt_dir = ROOT / "checkpoints/stagewise"
++    ckpt_dir.mkdir(parents=True, exist_ok=True)
++    bc_ckpt = ckpt_dir / "bc.pt"
++    current = bc_ckpt
++
++    if not args.skip_bc:
++        run([
++            sys.executable, "-u", str(TRAIN), "--mode", "bc", "--device", args.device,
++            "--seed", str(args.seed), "--torch-threads", str(args.torch_threads),
++            "--max-steps", str(cfg["bc_max_steps"]),
++            "--bc-matches", str(cfg["bc_matches"]),
++            "--bc-epochs", str(cfg["bc_epochs"]),
++            "--bc-batch-size", "512", "--bc-lr", "3e-4",
++            "--save-checkpoint", str(bc_ckpt),
++        ])
++    elif not bc_ckpt.exists():
++        raise FileNotFoundError(f"--skip-bc requested but {bc_ckpt} does not exist")
++
++    for st in cfg["stages"]:
++        stage = int(st["stage"])
++        if stage < args.start_stage or stage > args.end_stage:
++            continue
++        out = ckpt_dir / f"stage{stage}.pt"
++        run([
++            sys.executable, "-u", str(TRAIN), "--mode", "ppo", "--device", args.device,
++            "--seed", str(args.seed + 1000 * stage), "--torch-threads", str(args.torch_threads),
++            "--checkpoint", str(current), "--save-checkpoint", str(out),
++            "--curriculum-config", str(ROOT / cfg["curriculum"]),
++            "--fixed-stage", str(stage),
++            "--ppo-updates", str(st["updates"]),
++            "--ppo-envs-per-update", str(st["envs"]),
++            "--ppo-horizon", str(st["horizon"]),
++            "--ppo-epochs", "4", "--ppo-minibatch-size", "512",
++            "--ppo-lr", str(st["lr"]), "--ent-coef", str(st["ent"]),
++            "--eval-interval", "5", "--eval-matches", str(args.eval_matches),
++            "--snapshot-interval", "5",
++            "--stage-checkpoint-dir", str(ckpt_dir / "snapshots"),
++            "--best-checkpoint", str(ckpt_dir / f"best_stage{stage}.pt"),
++        ])
++        current = out
++
++    run([
++        sys.executable, "-u", str(TRAIN), "--mode", "export", "--device", "cpu",
++        "--checkpoint", str(current), "--export-dir", args.export_dir,
++    ])
++
++    print("\nStage-wise training completed.")
++    print(f"Final checkpoint: {current}")
++    print(f"Export folder: {ROOT / args.export_dir}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/curriculum_stagewise_v2.json b/curriculum_stagewise_v2.json
+--- /dev/null	2026-06-09 10:33:04.837313627 +0000
++++ rl_work/AIC-GDGoC-2026-main/curriculum_stagewise_v2.json	2026-06-09 10:53:20.153629617 +0000
+@@ -0,0 +1,10 @@
++{
++  "0": {"max_steps": 80,  "win_rate": 0.55},
++  "1": {"max_steps": 120, "win_rate": 0.45},
++  "2": {"max_steps": 160, "win_rate": 0.35},
++  "3": {"max_steps": 220, "win_rate": 0.32},
++  "4": {"max_steps": 280, "win_rate": 0.30},
++  "5": {"max_steps": 360, "win_rate": 0.28},
++  "6": {"max_steps": 430, "win_rate": 0.26},
++  "7": {"max_steps": 500, "win_rate": 0.25}
++}
+diff --git a/curriculum_sandbox_stagewise.json b/curriculum_sandbox_stagewise.json
+--- /dev/null	2026-06-09 10:33:04.837313627 +0000
++++ rl_work/AIC-GDGoC-2026-main/curriculum_sandbox_stagewise.json	2026-06-09 10:53:20.153713176 +0000
+@@ -0,0 +1,10 @@
++{
++  "0": {"max_steps": 60,  "win_rate": 0.45},
++  "1": {"max_steps": 80,  "win_rate": 0.35},
++  "2": {"max_steps": 100, "win_rate": 0.30},
++  "3": {"max_steps": 120, "win_rate": 0.28},
++  "4": {"max_steps": 140, "win_rate": 0.25},
++  "5": {"max_steps": 160, "win_rate": 0.24},
++  "6": {"max_steps": 180, "win_rate": 0.22},
++  "7": {"max_steps": 200, "win_rate": 0.20}
++}
+diff --git a/RUN_STAGEWISE_RL_TRAINING.md b/RUN_STAGEWISE_RL_TRAINING.md
+--- /dev/null	2026-06-09 10:33:04.837313627 +0000
++++ rl_work/AIC-GDGoC-2026-main/RUN_STAGEWISE_RL_TRAINING.md	2026-06-09 10:58:40.645183232 +0000
+@@ -0,0 +1,100 @@
++# Stage-wise RL training plan for BomberGame
++
++This repo now supports a more practical staged BC + PPO workflow than the single `--mode full` run.
++
++## Why this version is different
++
++Key fixes/tuning:
++
++1. **Correct D4 augmentation**
++   - Fixed the anti-diagonal spatial transform so its action labels are no longer inconsistent.
++
++2. **Better BC data**
++   - BC no longer throws away every safe trap/pressure bomb that does not immediately hit a box/enemy.
++   - BC uses mild inverse-frequency action weighting so STOP/move actions do not dominate bomb examples.
++
++3. **Stage-wise PPO**
++   - Added `--fixed-stage`, `--init-stage`, `--eval-matches`, `--stage-checkpoint-dir`, and `--best-checkpoint`.
++   - Each stage can be trained independently from the previous checkpoint.
++   - Snapshots and eval checkpoints are saved for rollback/selection.
++
++4. **Better curriculum**
++   - `curriculum_stagewise_v2.json` replaces the too-short 5/7/8/10-step curriculum.
++   - Stages move from short-rule-agent games toward longer codex-heavy games.
++
++5. **Safer export**
++   - Exported `agent.py` uses a conservative neural override gate.
++   - It falls back to a teacher league with `8.py`, `7.py`, and `4.py`.
++   - CPU threads are pinned to avoid 100ms/server spikes.
++
++## Recommended Kaggle medium run
++
++```bash
++%cd AIC-GDGoC-2026
++!pip install -r requirements.txt
++
++!python -u scripts/participant/stage_train_bc_ppo.py \
++  --profile kaggle_medium \
++  --device cuda \
++  --eval-matches 12 \
++  --export-dir exports/stagewise_hybrid_agent
++```
++
++This runs:
++
++- BC: 50 matches, 28 epochs, max_steps 220
++- PPO stage 0: 30 updates
++- PPO stage 1: 40 updates
++- PPO stage 2: 50 updates
++- PPO stage 3: 60 updates
++- PPO stage 4: 70 updates
++- PPO stage 5: 80 updates
++- PPO stage 6: 90 updates
++- PPO stage 7: 120 updates
++
++## Longer run
++
++```bash
++!python -u scripts/participant/stage_train_bc_ppo.py \
++  --profile kaggle_long \
++  --device cuda \
++  --eval-matches 16 \
++  --export-dir exports/stagewise_hybrid_agent_long
++```
++
++## Resume from a stage
++
++```bash
++!python -u scripts/participant/stage_train_bc_ppo.py \
++  --profile kaggle_medium \
++  --device cuda \
++  --skip-bc \
++  --start-stage 4 \
++  --end-stage 7 \
++  --eval-matches 12 \
++  --export-dir exports/stagewise_hybrid_agent_resume
++```
++
++## Benchmark after export
++
++```bash
++!python -m scripts.participant.benchmark \
++  --agents exports/stagewise_hybrid_agent agent/codex/4.py agent/codex/7.py agent/codex/8.py \
++  --matches 50 \
++  --max_steps 400 \
++  --timeout \
++  --timeout-ms 100
++```
++
++## Submission zip
++
++```bash
++cd exports/stagewise_hybrid_agent
++zip -r ../../stagewise_hybrid_agent_submission.zip agent.py model.pt 4.py 7.py 8.py
++```
++
++## Notes
++
++- Do not trust a checkpoint only because training reward improved. Select using benchmark + timeout.
++- If the neural-only/masked eval is still weak, keep the conservative export gate. It will behave like a strong teacher-league agent with occasional learned overrides.
++- If `fallback_rate` remains high through late stages, increase BC matches/epochs before increasing PPO.
+diff --git a/RL_STAGE2_REPORT.md b/RL_STAGE2_REPORT.md
+--- /dev/null	2026-06-09 10:33:04.837313627 +0000
++++ rl_work/AIC-GDGoC-2026-main/RL_STAGE2_REPORT.md	2026-06-09 10:58:40.658505926 +0000
+@@ -0,0 +1,45 @@
++# RL Stage-2 Patch Report
++
++## Implemented
++
++- Added stage-wise training driver: `scripts/participant/stage_train_bc_ppo.py`.
++- Added tuned curricula:
++  - `curriculum_stagewise_v2.json` for Kaggle/GPU.
++  - `curriculum_sandbox_stagewise.json` for CPU smoke testing.
++- Added fixed-stage PPO training via `--fixed-stage`.
++- Added per-stage and best checkpoint output.
++- Fixed D4 anti-diagonal augmentation mismatch.
++- Adjusted BC to retain safe trap/pressure bombs.
++- Added mild class-balanced BC loss.
++- Added BTC tie-break aligned terminal/stat reward shaping.
++- Made export more conservative and CPU-safe.
++
++## Sandbox training actually run
++
++Due to CPU-only constraints, I ran a compact smoke version:
++
++```bash
++python scripts/participant/stage_train_bc_ppo.py \
++  --profile smoke --device cpu --end-stage 1 \
++  --eval-matches 2 --torch-threads 1 \
++  --export-dir exports/stagewise_smoke_agent
++```
++
++Then continued one tiny fixed stage:
++
++```bash
++python -u scripts/participant/train_bc_ppo.py \
++  --mode ppo --device cpu --seed 2026 --torch-threads 1 \
++  --checkpoint checkpoints/stagewise/stage1.pt \
++  --save-checkpoint checkpoints/stagewise/stage2_tiny.pt \
++  --curriculum-config curriculum_sandbox_stagewise.json \
++  --fixed-stage 2 --ppo-updates 4 --ppo-envs-per-update 3 \
++  --ppo-horizon 24 --ppo-epochs 2 --ppo-minibatch-size 256 \
++  --ppo-lr 0.0002 --ent-coef 0.016 \
++  --eval-interval 2 --eval-matches 3
++```
++
++## Result
++
++The tiny CPU-trained model is valid and sometimes wins, but it is not a reliable replacement for the rule/search codex agents yet. This is expected from the very small CPU budget. The useful deliverable here is the corrected stage-wise training infrastructure and safer export path for a real Kaggle GPU run.
++

@@ -67,10 +67,10 @@ def compute_ranks(survivors, death_order, env):
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-parent_dir = Path(__file__).resolve().parent.parent
-# Add parent directory to sys.path if not already present
-if str(parent_dir) not in sys.path:
-    sys.path.insert(0, str(parent_dir))
+root_dir = Path(__file__).resolve().parents[2]
+# Add repository root to sys.path for direct execution from any cwd.
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
 
 from engine.game import BomberEnv
 from agent import RandomAgent, SimpleRuleAgent, SmarterRuleAgent, GeniusRuleAgent, BoxFarmerAgent, TacticalRuleAgent

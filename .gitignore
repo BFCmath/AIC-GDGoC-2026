@@ -13,3 +13,6 @@ submissions/
 .drive_locks/
 backups/
 training/
+checkpoints/
+exports/
+agent/codex/hybrid_ppo_agent_*/

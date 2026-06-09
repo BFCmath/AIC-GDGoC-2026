@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 
-NOTEBOOK = Path(__file__).resolve().parents[1] / "colab" / "base.ipynb"
+NOTEBOOK = Path(__file__).resolve().parents[1] / "colab" / "stagewise_rl_training.ipynb"
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -11,38 +11,40 @@ def _sources():
     return ["".join(cell.get("source", [])) for cell in nb["cells"]]
 
 
-def test_colab_base_is_valid_notebook_json():
+def test_notebook_is_valid_json():
     nb = json.loads(NOTEBOOK.read_text())
     assert nb["nbformat"] == 4
-    assert len(nb["cells"]) >= 10
+    assert len(nb["cells"]) >= 14
 
 
-def test_colab_base_contains_bc_ppo_export_sections():
+def test_notebook_has_required_sections():
     text = "\n".join(_sources())
     required = [
-        "Bomberland BC + PPO Hybrid Training",
-        "collect_expert_dataset",
-        "train_behavior_cloning",
-        "train_ppo",
-        "export_agent",
-        "exports/hybrid_ppo_agent",
+        "stage_train_bc_ppo.py",
+        "Behavior Cloning",
+        "PPO training",
+        "benchmark",
+        "--eval-matches",
     ]
     for marker in required:
         assert marker in text
 
 
-def test_colab_base_clones_bfcmath_training_repo_and_calls_script():
+def test_notebook_uses_stagewise_approach():
     text = "\n".join(_sources())
-    assert "https://github.com/BFCmath/AIC-GDGoC-2026.git" in text
-    assert "scripts/participant/train_bc_ppo.py" in text
-    assert "--mode full" in text
+    assert "kaggle_medium" in text
+    assert "--profile" in text
+    assert "EVAL_MATCHES" in text
 
 
-def test_export_template_contains_submission_agent_contract():
+def test_notebook_applies_patches():
     text = "\n".join(_sources())
-    assert "class Agent:" in text
-    assert "class PolicyValueNet" in text
-    assert "torch.inference_mode()" in text
+    assert "patch" in text and ".diff" in text
+
+
+def test_notebook_is_gpu_enabled():
+    nb = json.loads(NOTEBOOK.read_text())
+    assert nb["metadata"].get("accelerator") == "GPU"
 
 
 def test_train_bc_ppo_script_has_cli_entrypoint():
@@ -50,10 +52,19 @@ def test_train_bc_ppo_script_has_cli_entrypoint():
     text = script.read_text()
     assert "def main(" in text
     assert "argparse.ArgumentParser" in text
-    assert "if __name__ == \"__main__\":" in text
+    assert 'if __name__ == "__main__":' in text
 
 
-def test_inline_ppo_batch_append_keeps_reward_and_value_order():
+def test_stage_train_script_exists():
+    assert (ROOT / "scripts" / "participant" / "stage_train_bc_ppo.py").exists()
+
+
+def test_curriculum_configs_exist():
+    assert (ROOT / "configs" / "curriculum_stagewise_v2.json").exists()
+    assert (ROOT / "configs" / "curriculum_sandbox_stagewise.json").exists()
+
+
+def test_notebook_reflects_new_layout():
     text = "\n".join(_sources())
-    assert "batch.append(*record, reward, done)" not in text
-    assert "batch.append(spatial, scalar, mask, action, logprob, reward, done, value)" in text
+    assert "docs/patches" in text
+    assert "configs/curriculum_stagewise_v2.json" in text

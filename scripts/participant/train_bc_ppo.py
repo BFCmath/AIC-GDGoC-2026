@@ -58,11 +58,18 @@ MOVES = {
     4: (0, 1),
 }
 
+# Strong, diverse teachers. 4.py and 7.py remain important, but the training
+# pool deliberately includes later/earlier Codex variants and rule baselines so
+# PPO does not overfit to one local opponent style.
 EXPERT_SPECS = [
+    "agent/codex/8.py",
     "agent/codex/7.py",
+    "agent/codex/6.py",
+    "agent/codex/5.py",
     "agent/codex/4.py",
-    "agent/codex/1.py",
+    "agent/codex/3.py",
     "agent/codex/2.py",
+    "agent/codex/1.py",
     "TacticalRuleAgent",
     "GeniusRuleAgent",
     "SmarterRuleAgent",
@@ -70,16 +77,42 @@ EXPERT_SPECS = [
 ]
 
 OPPONENT_SPECS = [
+    "agent/codex/8.py",
     "agent/codex/7.py",
+    "agent/codex/6.py",
+    "agent/codex/5.py",
     "agent/codex/4.py",
-    "agent/codex/1.py",
+    "agent/codex/3.py",
     "agent/codex/2.py",
+    "agent/codex/1.py",
     "TacticalRuleAgent",
     "GeniusRuleAgent",
     "SmarterRuleAgent",
     "BoxFarmerAgent",
     "SimpleRuleAgent",
+    "RandomAgent",
 ]
+
+STAGE_OPPONENT_POOLS = {
+    0: ["RandomAgent", "SimpleRuleAgent", "SmarterRuleAgent"],
+    1: ["TacticalRuleAgent", "SmarterRuleAgent", "BoxFarmerAgent", "GeniusRuleAgent"],
+    2: ["agent/codex/4.py", "agent/codex/1.py", "SimpleRuleAgent", "TacticalRuleAgent"],
+    3: ["agent/codex/8.py", "agent/codex/3.py", "SmarterRuleAgent", "TacticalRuleAgent"],
+    4: ["agent/codex/7.py", "agent/codex/4.py", "GeniusRuleAgent", "TacticalRuleAgent"],
+    5: ["agent/codex/8.py", "agent/codex/7.py", "agent/codex/4.py", "SmarterRuleAgent"],
+    6: ["agent/codex/8.py", "agent/codex/7.py", "agent/codex/6.py", "agent/codex/4.py", "TacticalRuleAgent"],
+    7: ["agent/codex/8.py", "agent/codex/7.py", "agent/codex/6.py", "agent/codex/5.py", "agent/codex/4.py"],
+}
+
+EXPERT_SAMPLE_POOL = (
+    ["agent/codex/8.py"] * 5
+    + ["agent/codex/7.py"] * 5
+    + ["agent/codex/4.py"] * 4
+    + ["agent/codex/6.py"] * 3
+    + ["agent/codex/5.py"] * 2
+    + ["agent/codex/3.py", "agent/codex/2.py", "agent/codex/1.py"]
+    + ["TacticalRuleAgent", "GeniusRuleAgent", "SmarterRuleAgent", "BoxFarmerAgent"]
+)
 
 
 
@@ -452,7 +485,7 @@ class ExpertDataset(Dataset):
 
 def get_symmetries(spatial, mask, action):
     # Action remap tables for the 8 dihedral group elements (D4)
-    # actions: 0=STOP, 1=UP, 2=DOWN, 3=LEFT, 4=RIGHT, 5=BOMB
+    # actions: 0=STOP, 1=LEFT, 2=RIGHT, 3=UP, 4=DOWN, 5=BOMB
     remap = [
         [0, 1, 2, 3, 4, 5],  # 0: Identity
         [0, 4, 3, 1, 2, 5],  # 1: Rotate 90 CW (UP->RIGHT->DOWN->LEFT->UP)
@@ -461,7 +494,7 @@ def get_symmetries(spatial, mask, action):
         [0, 1, 2, 4, 3, 5],  # 4: Flip Horizontal (LEFT<->RIGHT)
         [0, 2, 1, 3, 4, 5],  # 5: Flip Vertical (UP<->DOWN)
         [0, 3, 4, 1, 2, 5],  # 6: Flip Diagonal (Transpose, UP<->LEFT, DOWN<->RIGHT)
-        [0, 4, 3, 2, 1, 5],  # 7: Flip Anti-diagonal (Transpose + Flip, UP<->RIGHT, DOWN<->LEFT)
+        [0, 4, 3, 2, 1, 5],  # 7: Flip anti-diagonal: (x,y)->(N-1-y,N-1-x)
     ]
     
     symmetries = []
@@ -481,7 +514,10 @@ def get_symmetries(spatial, mask, action):
         elif sym_idx == 6:
             sp = np.transpose(spatial, axes=(0, 2, 1))
         elif sym_idx == 7:
-            sp = np.flip(np.transpose(spatial, axes=(0, 2, 1)), axis=1)
+            # True anti-diagonal reflection.  The previous implementation only
+            # flipped one axis after transpose, which made the spatial transform
+            # inconsistent with the action remap and injected wrong BC labels.
+            sp = np.flip(np.transpose(spatial, axes=(0, 2, 1)), axis=(1, 2))
             
         m_table = remap[sym_idx]
         act_sym = m_table[action]
@@ -493,21 +529,13 @@ def get_symmetries(spatial, mask, action):
     return symmetries
 
 
-def collect_expert_dataset(num_matches, max_steps, seed):
+def collect_expert_dataset(num_matches, max_steps, seed, accept_safe_trap_bombs=True):
     env = BomberEnv(max_steps=max_steps, seed=seed)
     spatial_rows, scalar_rows, mask_rows, action_rows = [], [], [], []
     skipped = 0
+    action_hist = {a: 0 for a in range(ACTIONS)}
     for match in range(num_matches):
-        specs = []
-        for i in range(4):
-            r = random.random()
-            if r < 0.45:
-                specs.append("agent/codex/7.py")
-            elif r < 0.75:
-                specs.append("agent/codex/4.py")
-            else:
-                specs.append(random.choice(EXPERT_SPECS))
-
+        specs = [random.choice(EXPERT_SAMPLE_POOL) for _ in range(4)]
         experts = [make_agent(specs[i], i) for i in range(4)]
         obs = env.reset(seed=seed + match)
         for step in range(max_steps):
@@ -521,30 +549,51 @@ def collect_expert_dataset(num_matches, max_steps, seed):
                 actions.append(action)
                 if int(obs["players"][agent_id][2]) != 1:
                     continue
-                mask = legal_action_mask(obs, agent_id, veto_bombs=True)
+
+                # BC should imitate strong agents' trap/farming bombs when they
+                # are legal and escapable.  The previous veto_bombs=True mask
+                # rejected every bomb that did not immediately hit a box/enemy,
+                # which deletes many pressure/trap examples from codex 4/7/8.
+                mask = legal_action_mask(obs, agent_id, veto_bombs=not accept_safe_trap_bombs)
+                if accept_safe_trap_bombs:
+                    mask = legal_action_mask(obs, agent_id, veto_bombs=False)
+                    if action == 5 and not can_escape_after_bomb(obs, agent_id):
+                        skipped += 1
+                        continue
                 if not mask[action]:
                     skipped += 1
                     continue
                 spatial, scalar = encode_observation(obs, agent_id, step, max_steps=max_steps)
-                
-                # Apply 8-fold symmetries data augmentation
+
+                # Apply 8-fold D4 symmetries data augmentation.
                 for sp, msk, act in get_symmetries(spatial, mask, action):
-                    spatial_rows.append(sp)
+                    spatial_rows.append(np.ascontiguousarray(sp))
                     scalar_rows.append(scalar)
                     mask_rows.append(msk)
                     action_rows.append(act)
+                    action_hist[int(act)] += 1
             obs, terminated, truncated = env.step(actions)
             if terminated or truncated:
                 break
         if (match + 1) % max(1, num_matches // 10) == 0:
-            print(f"BC collection {match + 1}/{num_matches}: {len(action_rows)} samples, skipped={skipped}")
+            hist = ", ".join(f"{a}:{action_hist[a]}" for a in range(ACTIONS))
+            print(f"BC collection {match + 1}/{num_matches}: {len(action_rows)} samples, skipped={skipped}, hist=[{hist}]")
     return ExpertDataset(spatial_rows, scalar_rows, mask_rows, action_rows)
 
-
-def train_behavior_cloning(model, dataset, device, epochs, batch_size, lr, grad_clip):
+def train_behavior_cloning(model, dataset, device, epochs, batch_size, lr, grad_clip, weighted_loss=True):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    action_weight = None
+    if weighted_loss and len(dataset) > 0:
+        counts = torch.bincount(dataset.actions, minlength=ACTIONS).float()
+        inv = counts.sum() / torch.clamp(counts, min=1.0)
+        # Keep the correction mild: enough to prevent STOP/move dominance, not
+        # enough to make rare bombs explode in probability.
+        action_weight = torch.sqrt(inv / inv.mean()).to(device)
+        print("BC action weights:", [round(float(x), 3) for x in action_weight.cpu()])
     model.train()
+    best_acc = -1.0
+    best_state = None
     for epoch in range(epochs):
         total_loss, total_correct, total_seen = 0.0, 0, 0
         for spatial, scalar, masks, actions in loader:
@@ -552,7 +601,7 @@ def train_behavior_cloning(model, dataset, device, epochs, batch_size, lr, grad_
             masks, actions = masks.to(device), actions.to(device)
             logits, _ = model(spatial, scalar)
             logits = masked_logits(logits, masks)
-            loss = F.cross_entropy(logits, actions)
+            loss = F.cross_entropy(logits, actions, weight=action_weight)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -560,8 +609,14 @@ def train_behavior_cloning(model, dataset, device, epochs, batch_size, lr, grad_
             total_loss += float(loss.item()) * len(actions)
             total_correct += int((logits.argmax(dim=-1) == actions).sum().item())
             total_seen += len(actions)
-        print(f"BC epoch {epoch + 1}/{epochs}: loss={total_loss / max(total_seen, 1):.4f}, acc={total_correct / max(total_seen, 1):.3f}")
-
+        acc = total_correct / max(total_seen, 1)
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        print(f"BC epoch {epoch + 1}/{epochs}: loss={total_loss / max(total_seen, 1):.4f}, acc={acc:.3f}")
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"Loaded best BC epoch by train accuracy: acc={best_acc:.3f}")
 
 def sample_masked_action(model, spatial, scalar, mask, deterministic=False):
     logits, value = model(spatial, scalar)
@@ -772,8 +827,30 @@ def shaped_reward(prev_obs, obs, env, agent_id, action, done, prev_stats=None, c
     if action == 0 and not in_prev_danger:
         reward -= 0.02
 
+    # BTC tie-break shaping.  Most short/local curriculum games end at the step
+    # limit, so the policy must learn kills > boxes > items > bombs rather than
+    # pure survival.  This is deliberately small per step and larger at terminal.
+    if prev_stats is not None and cur_stats is not None:
+        bombs_diff = cur_stats["bombs"] - prev_stats["bombs"]
+        if bombs_diff > 0 and action == 5:
+            reward += 0.04 * bombs_diff
+
     # Terminal rank rewards
     if done:
+        # Add a small normalized terminal stat lead bonus aligned with BTC
+        # truncated-game tie-breakers.
+        try:
+            me = env.players[agent_id].stats
+            opp_stats = [env.players[i].stats for i in range(4) if i != agent_id]
+            stat_bonus = 0.0
+            for opp in opp_stats:
+                stat_bonus += 0.35 * np.sign(me["kills"] - opp["kills"])
+                stat_bonus += 0.08 * np.sign(me["boxes"] - opp["boxes"])
+                stat_bonus += 0.12 * np.sign(me["items"] - opp["items"])
+                stat_bonus += 0.02 * np.sign(me["bombs"] - opp["bombs"])
+            reward += float(stat_bonus)
+        except Exception:
+            pass
         ranks = rank_players(env, death_steps=death_steps)
         rank_val = ranks[agent_id]
         
@@ -823,6 +900,19 @@ class PPOBatch:
         return cls([], [], [], [], [], [], [], [])
 
 
+def opponent_pool_for_stage(stage: int):
+    return STAGE_OPPONENT_POOLS.get(int(stage), STAGE_OPPONENT_POOLS[7])
+
+
+def make_snapshot_agent(snapshot_models, agent_id, device):
+    if not snapshot_models:
+        return None
+    snapshot = random.choice(snapshot_models)
+    # Snapshot opponents use the same hard safety wrapper but no live fallback to
+    # avoid becoming just another copy of the rule teacher league.
+    return NeuralSafeAgent(agent_id, snapshot, device, deterministic=False, fallback_agent=None, use_mask=True)
+
+
 class NeuralSafeAgent:
     def __init__(self, agent_id, model, device, deterministic=False, fallback_agent=None, use_mask=True):
         self.agent_id = int(agent_id)
@@ -860,13 +950,14 @@ class NeuralSafeAgent:
                 dist = torch.distributions.Categorical(logits=logits)
                 action = torch.argmax(logits, dim=-1) if self.deterministic else dist.sample()
             
-            prob = probs[0, action].item()
+            action_i = int(action.item())
+            prob = float(probs[0, action_i].item())
             if self.fallback_agent is not None:
-                if prob < 0.25 or (self.use_mask and not mask[action]):
+                if prob < 0.25 or (self.use_mask and not bool(mask[action_i])):
                     try:
                         fallback_action = int(self.fallback_agent.act(obs))
                         self.fallback_count += 1
-                        return fallback_action
+                        return fallback_action if 0 <= fallback_action < ACTIONS else 0
                     except Exception:
                         pass
                         
@@ -891,22 +982,14 @@ def collect_ppo_rollout(model, device, horizon, envs, max_steps, seed, snapshot_
             if i == control_id:
                 agents.append(NeuralSafeAgent(i, model, device, fallback_agent=make_agent("agent/codex/7.py", i)))
             else:
-                if stage == 0:
-                    agents.append(make_agent(random.choice(["RandomAgent", "SimpleRuleAgent"]), i))
-                elif stage == 1:
-                    agents.append(make_agent(random.choice(["TacticalRuleAgent", "SmarterRuleAgent", "BoxFarmerAgent"]), i))
-                elif stage == 2:
-                    agents.append(make_agent(random.choice(["agent/codex/4.py", "SimpleRuleAgent", "SimpleRuleAgent"]), i))
-                elif stage == 3:
-                    agents.append(make_agent(random.choice(["agent/codex/8.py", "SimpleRuleAgent", "SimpleRuleAgent"]), i))
-                elif stage == 4:
-                    agents.append(make_agent(random.choice(["agent/codex/7.py", "SimpleRuleAgent", "SimpleRuleAgent"]), i))
-                elif stage == 5:
-                    agents.append(make_agent(random.choice(["agent/codex/7.py", "TacticalRuleAgent", "SmarterRuleAgent"]), i))
-                elif stage == 6:
-                    agents.append(make_agent(random.choice(["agent/codex/8.py", "agent/codex/4.py", "TacticalRuleAgent"]), i))
-                else: # Stage 7
-                    agents.append(make_agent(random.choice(["agent/codex/7.py", "agent/codex/4.py", "agent/codex/8.py"]), i))
+                # League sampling: top/local teachers + occasional old neural snapshots.
+                # This matches the online ladder idea better than only training vs 4.py/7.py.
+                snap_prob = min(0.35, 0.06 * max(0, stage))
+                snap_agent = make_snapshot_agent(snapshot_models, i, device) if random.random() < snap_prob else None
+                if snap_agent is not None:
+                    agents.append(snap_agent)
+                else:
+                    agents.append(make_agent(random.choice(opponent_pool_for_stage(stage)), i))
                         
         death_steps = {}
         prev_alive = {i: True for i in range(4)}
@@ -1014,23 +1097,7 @@ def evaluate_agent_win_rate(model, device, stage, max_steps, num_matches=20, age
             
         agents.append(agent)
         
-        if stage == 0:
-            opps = ["RandomAgent", "SimpleRuleAgent"]
-        elif stage == 1:
-            opps = ["TacticalRuleAgent", "SmarterRuleAgent", "BoxFarmerAgent"]
-        elif stage == 2:
-            opps = ["agent/codex/4.py", "SimpleRuleAgent", "SimpleRuleAgent"]
-        elif stage == 3:
-            opps = ["agent/codex/8.py", "SimpleRuleAgent", "SimpleRuleAgent"]
-        elif stage == 4:
-            opps = ["agent/codex/7.py", "SimpleRuleAgent", "SimpleRuleAgent"]
-        elif stage == 5:
-            opps = ["agent/codex/7.py", "TacticalRuleAgent", "SmarterRuleAgent"]
-        elif stage == 6:
-            opps = ["agent/codex/8.py", "agent/codex/4.py", "TacticalRuleAgent"]
-        else: # stage 7
-            opps = ["agent/codex/7.py", "agent/codex/4.py", "agent/codex/8.py"]
-            
+        opps = opponent_pool_for_stage(stage)
         for i in range(1, 4):
             agents.append(make_agent(random.choice(opps), i))
             
@@ -1088,8 +1155,11 @@ def train_ppo(model, device, args):
     initial_snap.eval()
     snapshot_models.append(initial_snap)
     
-    stage = 0
-    eval_interval = 25
+    stage = int(getattr(args, "fixed_stage", -1)) if int(getattr(args, "fixed_stage", -1)) >= 0 else int(getattr(args, "init_stage", 0))
+    eval_interval = max(1, int(getattr(args, "eval_interval", 5)))
+    eval_matches = max(1, int(getattr(args, "eval_matches", 10)))
+    best_eval_score = -1e9
+    Path(getattr(args, "stage_checkpoint_dir", "checkpoints/stages")).mkdir(parents=True, exist_ok=True)
     
     for update in range(args.ppo_updates):
         stage_cfg = CURRICULUM_CONFIG.get(stage, {"max_steps": args.max_steps, "win_rate": 0.40})
@@ -1097,28 +1167,39 @@ def train_ppo(model, device, args):
         stage_threshold = stage_cfg["win_rate"]
         
         # Evaluate and potentially advance stage
-        if update > 0 and update % eval_interval == 0 and stage < 7:
+        if update > 0 and update % eval_interval == 0:
             print(f"--- Evaluating Stage {stage} ---")
             
-            win_rate_codex, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="codex7")
+            win_rate_codex, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="codex7")
             print(f"Codex 7         : Win Rate: {win_rate_codex*100:.1f}%")
             
-            win_rate_neural, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="neural")
+            win_rate_neural, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="neural")
             print(f"Neural Only     : Win Rate: {win_rate_neural*100:.1f}%")
             
-            win_rate_mask, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="mask")
+            win_rate_mask, _ = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="mask")
             print(f"Neural + Mask   : Win Rate: {win_rate_mask*100:.1f}%")
             
-            win_rate_fallback, fallback_rate = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=10, agent_type="fallback")
+            win_rate_fallback, fallback_rate = evaluate_agent_win_rate(model, device, stage, stage_max_steps, num_matches=eval_matches, agent_type="fallback")
             print(f"Neural+Mask+Fall: Win Rate: {win_rate_fallback*100:.1f}%, Fallback Rate: {fallback_rate*100:.1f}%")
             
             print(f"(Threshold: {stage_threshold*100:.1f}%)")
-            
-            if (win_rate_mask >= stage_threshold or win_rate_fallback >= stage_threshold) and (win_rate_mask > win_rate_codex or win_rate_fallback > win_rate_codex):
+
+            eval_score = max(win_rate_mask, win_rate_fallback) - 0.25 * fallback_rate
+            if eval_score > best_eval_score:
+                best_eval_score = eval_score
+                Path(args.best_checkpoint).parent.mkdir(parents=True, exist_ok=True)
+                torch.save({"model_state_dict": model.state_dict(), "stage": stage, "update": update, "eval_score": eval_score}, args.best_checkpoint)
+                print(f"-> Saved best checkpoint to {args.best_checkpoint} (score={eval_score:.3f})")
+
+            stage_ckpt = Path(args.stage_checkpoint_dir) / f"stage{stage}_update{update}.pt"
+            torch.save({"model_state_dict": model.state_dict(), "stage": stage, "update": update, "eval_score": eval_score}, stage_ckpt)
+            print(f"-> Saved stage checkpoint: {stage_ckpt}")
+
+            if int(getattr(args, "fixed_stage", -1)) < 0 and stage < 7 and (win_rate_mask >= stage_threshold or win_rate_fallback >= stage_threshold) and (win_rate_mask > win_rate_codex or win_rate_fallback > win_rate_codex):
                 stage += 1
                 print(f"-> ADVANCED TO STAGE {stage}!")
             else:
-                print("-> Retrying stage...")
+                print("-> Continuing current stage...")
 
         print(f"PPO Update {update + 1}/{args.ppo_updates} | Curriculum Stage {stage}")
         trajectories = collect_ppo_rollout(
@@ -1186,11 +1267,14 @@ def train_ppo(model, device, args):
         print(f"PPO {update + 1}/{args.ppo_updates}: reward_mean={np.mean(flat_batch.rewards):.3f}, samples={len(actions)}")
         
         # Save snapshot
-        if (update + 1) % 10 == 0:
+        if (update + 1) % max(1, int(getattr(args, "snapshot_interval", 10))) == 0:
             snap = PolicyValueNet().to(device)
             snap.load_state_dict({k: v.detach().clone() for k, v in model.state_dict().items()})
             snap.eval()
             snapshot_models.append(snap)
+            snap_path = Path(args.stage_checkpoint_dir) / f"snapshot_stage{stage}_update{update+1}.pt"
+            torch.save({"model_state_dict": model.state_dict(), "stage": stage, "update": update + 1}, snap_path)
+            print(f"Saved snapshot checkpoint: {snap_path}")
 
 
 EXPORT_AGENT_TEMPLATE = """from collections import deque
@@ -1198,6 +1282,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+torch.set_num_threads(1)
 
 ACTIONS = 6
 BOARD = 13
@@ -1409,7 +1494,7 @@ def _forced(obs, aid):
     return None
 
 class Agent:
-    team_id = "HybridBCPPO_Shielded"
+    team_id = "LeagueBCPPO_Assassin"
     def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
         self.step_count = 0
@@ -1419,48 +1504,169 @@ class Agent:
         state = ckpt['model_state_dict'] if isinstance(ckpt, dict) and 'model_state_dict' in ckpt else ckpt
         self.model.load_state_dict(state)
         self.model.eval()
-        
+
+        # Small teacher league used as a tactical fallback/reranker. The neural
+        # policy only overrides this league when its safe action is clearly better.
+        self.teacher_agents = []
         self.fallback_agent = None
         try:
             import importlib.util
-            fallback_path = Path(__file__).parent / "7.py"
-            if not fallback_path.exists():
-                fallback_path = Path(__file__).parent / "4.py"
-            if fallback_path.exists():
-                spec = importlib.util.spec_from_file_location("fallback_teacher", fallback_path)
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                self.fallback_agent = module.Agent(self.agent_id)
+            for fname in ("8.py", "7.py", "4.py"):
+                fallback_path = Path(__file__).parent / fname
+                if fallback_path.exists():
+                    spec = importlib.util.spec_from_file_location(f"fallback_teacher_{fname}_{self.agent_id}", fallback_path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    agent = module.Agent(self.agent_id)
+                    # Prior reflects local ladder strength in the current repo: 8 is
+                    # generally strongest, then 7/4.  The prior is only a tiny
+                    # tie-break; the safety/tactical score still dominates.
+                    prior = {"8.py": 0.10, "7.py": 0.05, "4.py": 0.00}.get(fname, 0.0)
+                    self.teacher_agents.append((agent, prior))
+                    if self.fallback_agent is None:
+                        self.fallback_agent = agent
         except Exception:
             pass
 
+    def _mobility_from(self, obs, start, depth=3):
+        g, bombs = obs['map'], obs['bombs']
+        blocked = _bomb_pos(bombs)
+        q = deque([(start, 0)])
+        seen = {start}
+        while q:
+            pos, d = q.popleft()
+            if d >= depth:
+                continue
+            for a in [1, 2, 3, 4]:
+                np_ = _next(pos, a)
+                if np_ in seen or np_ in blocked or not _pass(g, np_[0], np_[1]):
+                    continue
+                seen.add(np_)
+                q.append((np_, d + 1))
+        return len(seen)
+
+    def _box_spots(self, g):
+        spots = []
+        for x in range(g.shape[0]):
+            for y in range(g.shape[1]):
+                if int(g[x, y]) != BOX:
+                    continue
+                for a in [1, 2, 3, 4]:
+                    p = _next((x, y), a)
+                    if _pass(g, p[0], p[1]):
+                        spots.append(p)
+        return spots
+
+    def _action_score(self, obs, action):
+        aid = self.agent_id
+        g, players, bombs = obs['map'], obs['players'], obs['bombs']
+        if aid >= len(players) or int(players[aid][2]) != 1:
+            return -1e9 if action != 0 else 0.0
+        mask = _get_safe_actions_mask(obs, aid)
+        if action < 0 or action >= ACTIONS or not bool(mask[action]):
+            return -1e9
+        p = players[aid]
+        pos = (int(p[0]), int(p[1]))
+        radius = 1 + int(p[4])
+        danger = _danger(g, bombs, players, 8)
+        enemies = [(int(op[0]), int(op[1])) for i, op in enumerate(players) if i != aid and int(op[2]) == 1]
+        items = [(x, y) for x in range(g.shape[0]) for y in range(g.shape[1]) if int(g[x, y]) in (ITEM_RADIUS, ITEM_CAPACITY)]
+        box_spots = self._box_spots(g)
+
+        if action == 5:
+            if not _can_escape_bomb(obs, aid):
+                return -1e8
+            boxes = _boxes_hit(g, pos, radius)
+            enemy_hits = _enemies_hit(g, players, aid, pos, radius)
+            score = 0.15 + 1.25 * boxes + 7.0 * enemy_hits
+            if boxes == 0 and enemy_hits == 0:
+                score -= 1.5
+            if pos in danger.get(1, set()):
+                score -= 20.0
+            return score
+
+        npos = _next(pos, action)
+        if not _pass(g, npos[0], npos[1]) or npos in _bomb_pos(bombs):
+            return -1e9
+
+        score = 0.0
+        if npos in danger.get(1, set()):
+            score -= 100.0
+        if npos in danger.get(2, set()):
+            score -= 7.0
+        if any(npos in danger.get(t, set()) for t in range(3, 8)):
+            score -= 0.35
+        if pos in set().union(*danger.values()) and npos not in set().union(*danger.values()):
+            score += 0.7
+
+        cell = int(g[npos[0], npos[1]])
+        if cell == ITEM_CAPACITY:
+            score += 3.2
+        elif cell == ITEM_RADIUS:
+            score += 2.4
+
+        score += 0.06 * self._mobility_from(obs, npos, 3)
+        score += 0.16 * (_nearest(pos, items, 13) - _nearest(npos, items, 13))
+        score += 0.12 * (_nearest(pos, box_spots, 13) - _nearest(npos, box_spots, 13))
+        if radius >= 2 or self.step_count > 200:
+            score += 0.05 * (_nearest(pos, enemies, 13) - _nearest(npos, enemies, 13))
+        if action == 0:
+            score -= 0.25
+        return float(score)
+
+    def _teacher_action(self, obs):
+        best_action, best_score = 0, -1e18
+        counts = {}
+        for entry in self.teacher_agents:
+            if isinstance(entry, tuple):
+                teacher, prior = entry
+            else:
+                teacher, prior = entry, 0.0
+            try:
+                a = int(teacher.act(obs))
+            except Exception:
+                continue
+            if not (0 <= a < ACTIONS):
+                continue
+            counts[a] = counts.get(a, 0) + 1
+            score = self._action_score(obs, a) + prior + 0.04 * counts[a]
+            if score > best_score:
+                best_action, best_score = a, score
+        if best_score <= -1e17 and self.fallback_agent is not None:
+            try:
+                return int(self.fallback_agent.act(obs))
+            except Exception:
+                return 0
+        return best_action
 
     def act(self, obs):
         try:
             forced = _forced(obs, self.agent_id)
             if forced is not None:
                 return int(forced)
-                
+
+            teacher_action = self._teacher_action(obs)
+            teacher_score = self._action_score(obs, teacher_action)
             mask = _get_safe_actions_mask(obs, self.agent_id)
             spatial, scalar = _encode(obs, self.agent_id, self.step_count)
-            
+
             with torch.inference_mode():
                 s = torch.from_numpy(spatial).unsqueeze(0)
                 a = torch.from_numpy(scalar).unsqueeze(0)
                 logits, _ = self.model(s, a)
                 probs = torch.softmax(logits, dim=-1)
-                
                 masked_log = logits.masked_fill(~torch.from_numpy(mask).unsqueeze(0).bool(), -1e9)
-                action = int(torch.argmax(masked_log, dim=-1).item())
-                
-                prob = probs[0, action].item()
-                if (prob < 0.25 or not mask[action]) and self.fallback_agent is not None:
-                    try:
-                        return int(self.fallback_agent.act(obs))
-                    except Exception:
-                        pass
+                neural_action = int(torch.argmax(masked_log, dim=-1).item())
+                neural_prob = float(probs[0, neural_action].item())
+
+            neural_score = self._action_score(obs, neural_action)
             self.step_count += 1
-            return action if 0 <= action <= 5 else 0
+            # Conservative gate: until PPO is deeply trained, the neural policy is
+            # mostly a tactical specialist.  Let it override the teacher league
+            # only when both probability and independent tactical score agree.
+            if neural_prob >= 0.72 and neural_score >= teacher_score + 0.35:
+                return neural_action if 0 <= neural_action < ACTIONS else 0
+            return teacher_action if 0 <= teacher_action < ACTIONS else 0
         except Exception:
             if self.fallback_agent is not None:
                 try:
@@ -1485,6 +1691,14 @@ def export_agent(model, export_dir):
     )
     (export_path / "agent.py").write_text(EXPORT_AGENT_TEMPLATE)
     
+    # Copy top rule/search teachers as CPU-safe fallbacks.
+    try:
+        import shutil
+        shutil.copy(ROOT / "agent/codex/8.py", export_path / "8.py")
+        print(f"Copied 8.py as fallback teacher to {export_path}")
+    except Exception as e:
+        print(f"Warning: Failed to copy 8.py: {e}")
+
     # Copy 4.py as fallback teacher
     try:
         import shutil
@@ -1545,6 +1759,15 @@ def build_arg_parser():
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--ppo-minibatch-size", type=int, default=512)
     parser.add_argument("--ppo-lr", type=float, default=2.5e-4)
+    parser.add_argument("--eval-interval", type=int, default=5, help="PPO updates between curriculum evaluations")
+    parser.add_argument("--eval-matches", type=int, default=10, help="Matches per PPO evaluation probe")
+    parser.add_argument("--snapshot-interval", type=int, default=10, help="PPO updates between self-play snapshots")
+    parser.add_argument("--fixed-stage", type=int, default=-1, help="Train only this curriculum stage; no auto-advance when >=0")
+    parser.add_argument("--init-stage", type=int, default=0, help="Initial curriculum stage for auto mode")
+    parser.add_argument("--stage-checkpoint-dir", default="checkpoints/stages", help="Directory for per-stage PPO checkpoints")
+    parser.add_argument("--best-checkpoint", default="checkpoints/best_hybrid_bc_ppo.pt", help="Best PPO checkpoint selected by eval score")
+    parser.add_argument("--bc-unweighted", action="store_true", help="Disable mild inverse-frequency BC action weighting")
+    parser.add_argument("--torch-threads", type=int, default=1, help="CPU torch threads; 1 is much faster in Colab/CPU smoke runs")
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-eps", type=float, default=0.2)
@@ -1561,6 +1784,8 @@ def build_arg_parser():
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+    if getattr(args, "torch_threads", 0):
+        torch.set_num_threads(max(1, int(args.torch_threads)))
     
     if args.curriculum_config:
         global CURRICULUM_CONFIG
@@ -1580,7 +1805,7 @@ def main(argv=None):
 
     if args.mode in {"bc", "full"}:
         dataset = collect_expert_dataset(args.bc_matches, args.max_steps, args.seed)
-        train_behavior_cloning(model, dataset, device, args.bc_epochs, args.bc_batch_size, args.bc_lr, args.grad_clip)
+        train_behavior_cloning(model, dataset, device, args.bc_epochs, args.bc_batch_size, args.bc_lr, args.grad_clip, weighted_loss=not args.bc_unweighted)
         Path(args.save_checkpoint).parent.mkdir(parents=True, exist_ok=True)
         torch.save({"model_state_dict": model.state_dict()}, args.save_checkpoint)
         print(f"Saved checkpoint to {args.save_checkpoint}")
