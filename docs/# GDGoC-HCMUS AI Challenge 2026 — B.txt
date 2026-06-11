@@ -1,0 +1,439 @@
+# GDGoC-HCMUS AI Challenge 2026 — BomberGame / Bom IT Agent Context and Benchmark Rules
+
+## 1. Competition Overview
+
+**Competition name:** GDGoC-HCMUS AI Challenge 2026
+**Organizer:** Google Developer Group on Campus, University of Science – VNUHCM, Team AI&DS – Development Department
+**Theme:** Reinforcement Learning
+**Problem:** Build an autonomous agent for a multi-team competitive game environment inspired by Bom IT / Bomberman.
+
+The goal of the agent is to make real-time strategic decisions in order to:
+
+* Move effectively on the map.
+* Place bombs to destroy boxes or eliminate opponents.
+* Avoid dangerous areas caused by bomb explosions.
+* Collect power-up items.
+* Survive as long as possible.
+* Eliminate opposing agents.
+
+---
+
+## 2. Competition Format
+
+Each team may have a maximum of **2 members**.
+
+Each match consists of:
+
+* **4 teams**.
+* Each team controls **1 agent**.
+* There are **4 agents** in total in one match.
+
+Agents can perform the following main types of behavior:
+
+* Movement.
+* Bomb placement.
+* Destroying crates / boxes.
+* Collecting power-up items.
+
+---
+
+## 3. Competition Process
+
+### Round 1 — Training and Matches
+
+**Time:** May 21 – June 21.
+
+The Organizing Committee provides:
+
+* Instructional documentation.
+* Baseline agent.
+* Guidelines for interacting with the environment.
+* Reinforcement Learning learning materials.
+* Participant kit, including the engine, visualizer, and related tools.
+* Guidelines for using Kaggle / Colab to train models.
+
+During this round:
+
+* The Organizing Committee acts as mentor and supports participating teams.
+* Teams may submit multiple times.
+* Agents are automatically matched against agents from other teams or against baseline agents.
+* The leaderboard is updated based on automatic match results.
+
+### Round 2 — Online Pitching
+
+**Time:** June 24.
+
+The top 5 teams with the highest ranking in the Grand Finals will present their model and methodology.
+
+---
+
+## 4. Technical Requirements and Constraints
+
+Teams are allowed to use different methods, including:
+
+* Reinforcement Learning.
+* Rule-based methods.
+* Hybrid rule-based + learning methods.
+* Search-based planning.
+* Other machine learning methods, if appropriate.
+
+Important constraint:
+
+* **External model APIs must not be used during competition matches.**
+
+Additional recommendations and requirements:
+
+* PyTorch or TensorFlow is encouraged.
+* The agent must make fast decisions in a multi-agent environment with a large state space, adversarial behavior, and many possible strategies.
+
+Organizational information:
+
+* Registration link: https://forms.gle/E3N6JWXLBsZXhRP26
+* Registration opens: May 21.
+* Total prize pool: 1,500,000 VND.
+* Support / guidance channel: `#Tổng quan`.
+
+---
+
+## 5. Game Environment
+
+The game is a turn-based tactical environment on a grid map.
+
+In the technical documentation, the environment is described as a Bomberland / Bomberman-style game with:
+
+* 4 agents.
+* A **13 × 13** grid map.
+* Each agent chooses 1 action at every step.
+* Each match has a maximum of **500 steps**.
+* Each step has strict processing constraints; the documentation mentions **100 ms/step** when discussing planning/search.
+
+The practical objective of the agent is not only to find the shortest path, but also to:
+
+* Predict opponent actions.
+* Calculate dangerous areas caused by bombs.
+* Optimize box destruction to collect items.
+* Find escape routes after placing bombs.
+* Balance offense, defense, farming, and survival.
+
+---
+
+## 6. Step Processing Order
+
+At each step, the engine processes actions in the following order:
+
+1. Collect actions from all agents.
+2. Process movement.
+3. Place bombs.
+4. Decrease bomb timers.
+5. Resolve explosions.
+6. Eliminate agents.
+7. Spawn items.
+8. Check match-ending conditions.
+
+This order is important when writing an agent, because the action at the current step may determine:
+
+* Whether the agent can escape from a bomb in time.
+* Whether a bomb is placed successfully.
+* Whether an item is collected or destroyed.
+
+---
+
+## 7. Agent Action Space
+
+At each step, the agent returns an integer representing its action:
+
+| Value | Action     | Meaning                              |
+| ----: | ---------- | ------------------------------------ |
+|     0 | STOP       | Stay at the current position         |
+|     1 | LEFT       | Move left by 1 cell                  |
+|     2 | RIGHT      | Move right by 1 cell                 |
+|     3 | UP         | Move up by 1 cell                    |
+|     4 | DOWN       | Move down by 1 cell                  |
+|     5 | PLACE_BOMB | Place a bomb at the current position |
+
+---
+
+## 8. Movement Rules
+
+An agent cannot move into:
+
+* A **Wall**, encoded as `1`.
+* A **Box**, encoded as `2`.
+* A cell that already contains a bomb from previous steps.
+
+Exception:
+
+* If the agent has just placed a bomb on its current cell in the same step, the agent is still allowed to move away from that cell in later steps according to the game mechanism that allows escaping from a newly placed bomb.
+
+Position overlap rule:
+
+* Multiple agents may stand on the same cell.
+* If 2 or more agents move into the same cell containing an item, the item is destroyed and no agent receives it.
+
+---
+
+## 9. Bomb Mechanics
+
+### 9.1. Default Bomb Parameters
+
+Each agent initially has:
+
+* **Bomb timer:** 7 steps.
+* **Radius:** starts at 1, maximum is 5.
+* **Bomb capacity:** starts at 1, maximum is 5.
+
+A bomb explodes when its timer decreases to **≤ 0**.
+
+### 9.2. Conditions for Placing a Bomb
+
+An agent can place a bomb only if:
+
+* `bombs_left > 0`.
+* The current cell does not already contain a bomb from a previous step.
+
+### 9.3. Multiple Agents Placing Bombs on the Same Cell
+
+If multiple agents place bombs on the same cell:
+
+1. The bomb with the larger radius has priority.
+2. If the radius is the same, the agent with the smaller ID has priority.
+3. Only the agent whose bomb is kept according to the above rule has `bombs_left` reduced.
+
+### 9.4. Explosion Mechanics
+
+A bomb explodes in a cross shape, spreading in 4 directions:
+
+* Left.
+* Right.
+* Up.
+* Down.
+
+Obstacles:
+
+* Walls completely block the explosion.
+* Boxes block the explosion and are destroyed.
+* Agents do not block the explosion.
+
+Chain reaction:
+
+* If an explosion reaches another bomb, that bomb explodes immediately in the same step.
+
+---
+
+## 10. Item Mechanics
+
+Items increase an agent’s power. There are two item types:
+
+* **Radius** increase item.
+* **Capacity** increase item.
+
+### 10.1. Items Dropped from Destroyed Boxes
+
+When a box is destroyed:
+
+* 30% chance to drop a Radius item.
+* 30% chance to drop a Capacity item.
+* 40% chance to drop nothing.
+
+The total probability of getting an item from a destroyed box is 60%.
+
+### 10.2. Auto-Spawn Items
+
+At each empty grass cell, the probability of an item spawning at each step is:
+
+```text
+P = 0.0003 × (step / 165)
+```
+
+If an item spawns:
+
+* 50% chance it is a Radius item.
+* 50% chance it is a Capacity item.
+
+---
+
+## 11. Agent Elimination and Match Ending Conditions
+
+An agent is eliminated immediately if it stands in a cell affected by an explosion, even if the bomb was placed by that same agent.
+
+An eliminated agent’s existing bombs remain on the map. These bombs can still explode and affect the game later.
+
+A match ends when:
+
+1. Only **≤ 1 agent** remains alive.
+2. Or the match reaches the limit of **500 steps**.
+
+In the general rules file, the ending condition is described at the team level: the match ends when only one team still has an agent on the map, or when the time limit is reached.
+
+In the technical guide, this is specified more concretely as: **≤ 1 surviving agent or 500 steps**.
+
+---
+
+## 12. Information the Agent Should Observe or Infer
+
+The documentation does not provide an official observation schema. However, based on the game rules, an effective agent should build an internal state containing the following information.
+
+### 12.1. Map Information
+
+* Map size.
+* Wall positions.
+* Box positions.
+* Empty / grass cell positions.
+* Radius item positions.
+* Capacity item positions.
+
+### 12.2. Self Information
+
+* Current position.
+* Current radius.
+* Current bomb capacity.
+* `bombs_left`.
+* Alive / dead status.
+
+### 12.3. Opponent Information
+
+* Positions of other agents.
+* Which agents are still alive.
+* Distance to each opponent.
+* Whether opponents are likely able to place bombs, based on their position and bomb state.
+
+### 12.4. Bomb Information
+
+* Position of each bomb.
+* Remaining timer.
+* Bomb radius.
+* Bomb owner, if available.
+* Expected explosion area.
+* Possible chain reactions.
+
+### 12.5. Tactical Features Worth Computing
+
+* Future danger map for each upcoming step.
+* Safe cells that can be reached before bombs explode.
+* Distance to the nearest safe item.
+* Distance to the nearest opponent.
+* Number of boxes that can be destroyed by placing a bomb at the current position.
+* Escape route after placing a bomb.
+* Positions where opponents can be trapped.
+* Cells where opponents may place bombs to block escape routes.
+
+---
+
+# 13. Benchmark Format
+
+The benchmark used by the Organizing Committee is an **online arena / ladder benchmark**, not a one-time fixed test set.
+
+In other words, benchmarking is done by letting agents play many matches against a dynamic pool of opponents. Results are used to update ratings, and the leaderboard is determined from those ratings.
+
+---
+
+## 14. Submission Format
+
+Each submission is treated as an agent.
+
+Teams submit a `.zip` file. The submission must contain at least:
+
+* `agent.py`
+
+The submission may also include additional files if needed, such as:
+
+* Model weights.
+* Utility files.
+* Supporting code.
+
+---
+
+## 15. Active Pool
+
+Submitted agents are added to the **Active Pool**.
+
+The Active Pool consists of:
+
+* Baseline agents.
+* The best agent from each team.
+* The 2 newest agents from each team.
+* The top 10 agents that have played at least 10 matches.
+
+---
+
+## 16. Matchmaking Rules
+
+When benchmarking, the system does not choose opponents completely at random.
+
+Instead, opponents are sampled according to the following proportions:
+
+* **40%** are agents with a rating close to the current agent.
+* **30%** are top agents.
+* **30%** are random agents.
+
+This creates a benchmark that combines:
+
+* Fair matches against similarly rated agents.
+* Strong matches against top-performing agents.
+* Exploratory matches against random agents.
+
+---
+
+## 17. Benchmark Server Resource Limits
+
+The judging server runs on the following machine:
+
+* Google Cloud VM: `e2-standard-8`
+* 8 vCPUs
+* 32 GB RAM
+* Ubuntu 22.04
+* Python 3.11
+
+Runtime limits:
+
+* Each agent step has a **100 ms inference timeout**.
+* Startup timeout is **20 seconds**.
+* Each match has a maximum of **500 steps**.
+
+These limits mean that agents must make decisions quickly and cannot rely on slow inference or expensive planning during live matches.
+
+---
+
+## 18. Match Result Rules
+
+Each match contains 4 agents.
+
+The in-match ranking is based primarily on survival / elimination order:
+
+* The agent that dies earliest receives the worst rank.
+* The agent that dies last, or the only surviving agent, receives the best rank.
+* Agents that die on the same step receive the same rank.
+
+If the match reaches 500 steps and multiple agents are still alive, the tie-breakers are applied in this order:
+
+1. Kills.
+2. Number of boxes destroyed.
+3. Number of items collected.
+4. Number of bombs placed.
+
+The final match result is classified as:
+
+* **Win:** the agent has the best rank and is the only agent with that best rank.
+* **Draw:** the agent shares the best rank with at least one other agent.
+* **Loss:** the agent does not achieve the best rank.
+
+---
+
+## 19. Rating and Leaderboard
+
+The benchmark uses **TrueSkill** to update ratings after matches.
+
+Initial rating values are approximately:
+
+* `mu = 100`
+* `sigma = 33.33`
+
+The leaderboard is ranked based on rating after repeated matches in the online arena / ladder system.
+
+---
+
+## 20. Benchmark Summary
+
+In summary:
+
+The benchmark works by putting each submitted agent into a dynamic opponent pool, matching it repeatedly against other agents using a mix of rating-based, top-agent, and random sampling, running matches on a resource-limited server with a 100 ms/step inference limit, converting match outcomes into TrueSkill updates, and ranking agents on the leaderboard according to their updated ratings.
