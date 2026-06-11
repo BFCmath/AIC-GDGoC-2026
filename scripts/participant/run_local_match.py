@@ -23,26 +23,17 @@ def _tb_key(player_obj):
     return (s['kills'], s['boxes'], s['items'], s['bombs'])
 
 
-def compute_ranks(survivors, death_order, env):
+def compute_ranks(survivors, death_steps, env):
     """
     Compute ranks[4] (lower = better) following BTC rules:
-      - 0 survivors  : rank by reversed death_order.
-      - 1 survivor   : rank 0; dead ranked by death_order.
-      - ≥2 survivors : tie-break by kills > boxes > items > bombs (desc);
-                        equal stats → same rank; dead ranked below survivors.
+      - Dead same step → same rank.
+      - Survivors: tie-break by kills > boxes > items > bombs (desc);
+                   equal stats → same rank; dead ranked below survivors.
     """
-    ranks = [None] * 4
+    ranks = [0] * 4
 
-    if len(survivors) == 0:
-        current_rank = 0
-        for j in reversed(death_order):
-            ranks[j] = current_rank
-            current_rank += 1
-        return ranks
-
-    if len(survivors) == 1:
-        ranks[survivors[0]] = 0
-    else:
+    # Rank survivors by stats tie-break
+    if survivors:
         sorted_surv = sorted(
             survivors,
             key=lambda i: _tb_key(env.players[i]),
@@ -50,18 +41,20 @@ def compute_ranks(survivors, death_order, env):
         )
         rank_val = 0
         for idx, pi in enumerate(sorted_surv):
-            if idx > 0:
-                prev = sorted_surv[idx - 1]
-                if _tb_key(env.players[pi]) < _tb_key(env.players[prev]):
-                    rank_val = idx
+            if idx > 0 and _tb_key(env.players[pi]) < _tb_key(env.players[sorted_surv[idx - 1]]):
+                rank_val = idx
             ranks[pi] = rank_val
 
-    # Dead players ranked below all survivors
-    num_surv_ranks = max(ranks[i] for i in survivors) + 1
-    current_rank = num_surv_ranks
-    for j in reversed(death_order):
-        ranks[j] = current_rank
-        current_rank += 1
+    # Rank dead players by death step (died later = better rank)
+    dead = [i for i in range(4) if i not in survivors]
+    if dead:
+        base = max((ranks[i] for i in survivors), default=-1) + 1
+        dead_sorted = sorted(dead, key=lambda i: death_steps.get(i, 0), reverse=True)
+        rank_val = base
+        for idx, pid in enumerate(dead_sorted):
+            if idx > 0 and death_steps.get(pid, 0) < death_steps.get(dead_sorted[idx - 1], 0):
+                rank_val = base + idx
+            ranks[pid] = rank_val
 
     return ranks
 
@@ -169,7 +162,7 @@ def run_match(agent_paths, num_episodes=10, max_steps=500, seed=None):
         obs = env.reset(seed=episode_seed)
         done = False
         step = 0
-        death_order = []          # player indices in order of death
+        death_steps = {}          # player index → step when died
         prev_alive = [bool(p[2]) for p in obs["players"]]
 
         while not done and step < max_steps:
@@ -189,19 +182,20 @@ def run_match(agent_paths, num_episodes=10, max_steps=500, seed=None):
             alive_now = [bool(p[2]) for p in obs["players"]]
             for i in range(n_players):
                 if prev_alive[i] and not alive_now[i]:
-                    death_order.append(i)   # track index, not name
+                    death_steps[i] = step
             prev_alive = alive_now
 
         alive_final = [bool(p[2]) for p in obs["players"]]
         survivors = [i for i in range(n_players) if alive_final[i]]
 
         # BTC-accurate ranking with tie-break
-        ranks = compute_ranks(survivors, death_order, env)
+        ranks = compute_ranks(survivors, death_steps, env)
         tb_applied = truncated and len(survivors) > 1
         tb_note = " [tie-break]" if tb_applied else ""
 
         winners = [i for i in range(n_players) if ranks[i] == 0]
-        died_names = [names[j] for j in death_order]
+        died_indices = sorted(death_steps, key=lambda i: death_steps[i])
+        died_names = [names[j] for j in died_indices]
 
         if len(winners) == 1:
             w = winners[0]

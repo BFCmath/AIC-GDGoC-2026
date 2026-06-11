@@ -20,6 +20,8 @@
 | wiggle-tracker | Task 2: Implement WiggleTracker in the Environment Runner | done | Added prev_visited_positions logic to prevent wiggling
 | win-rate-evaluator | Task 3: Implement Objective Win-Rate Evaluator & 8-Stage Curriculum | done | Added evaluate_agent_win_rate logic and stage advancement based on win rate |
 | bc-initialization | Task 4: Update BC Initialization | done | Verified config and synced colab notebook |
+| fix-win-draw-bug | Task 1: Fix Win/Draw Padded Agent Bug in benchmark.py | done | Verified with 2-match participant run. |
+| parallelize-benchmark | Task 2: Implement Multiprocessing in benchmark_6way.py | done | Implemented unbuffered multiprocessing and ran the 96-match rotate benchmark. |
 
 
 

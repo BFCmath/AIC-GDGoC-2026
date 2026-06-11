@@ -149,7 +149,7 @@ def run_benchmark(
             done = False
             step = 0
             prev_alive = [bool(p[2]) for p in obs["players"]]
-            death_order = []   # indices in order of death
+            death_steps = {}   # player index → step when died
 
             while not done and step < max_steps:
                 actions = []
@@ -185,7 +185,7 @@ def run_benchmark(
                 alive_now = [bool(p[2]) for p in obs["players"]]
                 for j in range(4):
                     if prev_alive[j] and not alive_now[j]:
-                        death_order.append(j)
+                        death_steps[j] = step
                 prev_alive = alive_now
 
             # ── Ranking ──────────────────────────────────────────────────────
@@ -193,16 +193,16 @@ def run_benchmark(
             survivors = [j for j in range(4) if alive_final[j]]
 
             # BTC-accurate ranks (with tie-break applied when truncated + ≥2 survivors)
-            ranks = compute_ranks(survivors, death_order, env)
+            ranks = compute_ranks(survivors, death_steps, env)
             tb_applied = truncated and len(survivors) > 1
 
             # Win/Draw determination for tracked agents
-            tracked_winners = [i for i in range(n) if ranks[i] == 0]
+            total_winners = [j for j in range(4) if ranks[j] == 0]
 
             for i in range(n):
                 match_stats[i]["rank_sum"] += ranks[i]
                 if ranks[i] == 0:
-                    if len(tracked_winners) == 1:
+                    if len(total_winners) == 1:
                         match_stats[i]["wins"] += 1
                     else:
                         match_stats[i]["draws"] += 1
@@ -217,11 +217,12 @@ def run_benchmark(
                 ratings[i] = new_ratings[i][0]
 
             # ── Result label ─────────────────────────────────────────────────
-            if len(tracked_winners) == 1:
-                result_label = colorize(f"WIN → {names[tracked_winners[0]]}", GREEN)
-            elif len(tracked_winners) > 1:
+            all_winners = [j for j in range(4) if ranks[j] == 0]
+            if len(all_winners) == 1:
+                result_label = colorize(f"WIN → {cur_names[all_winners[0]]}", GREEN)
+            elif len(all_winners) > 1:
                 result_label = colorize(
-                    f"DRAW ({', '.join(names[w] for w in tracked_winners)})", YELLOW
+                    f"DRAW ({', '.join(cur_names[w] for w in all_winners)})", YELLOW
                 )
             else:
                 result_label = colorize("ALL DEAD", DIM)
@@ -250,10 +251,10 @@ def run_benchmark(
     print(colorize("  📊  FINAL LEADERBOARD", BOLD + CYAN))
     print(colorize("═" * 66, CYAN))
 
-    col = [20, 6, 6, 9, 12]
+    col = [20, 9, 6, 6, 9]
     header = (
-        f"  {'Agent':<{col[0]}} {'Wins':>{col[1]}} {'Draws':>{col[2]}} "
-        f"{'AvgRank':>{col[3]}} {'TrueSkill':>{col[4]}}"
+        f"  {'Agent':<{col[0]}} {'Score':>{col[1]}} {'Wins':>{col[2]}} "
+        f"{'Draws':>{col[3]}} {'AvgRank':>{col[4]}}"
     )
     print(colorize(header, BOLD))
     print(colorize("  " + "─" * 64, DIM))
@@ -272,10 +273,10 @@ def run_benchmark(
         c = colors[min(rank_pos, 3)]
         row = (
             f"  {medals[min(rank_pos, 3)]} {names[i]:<{col[0]-2}} "
-            f"{match_stats[i]['wins']:>{col[1]}} "
-            f"{match_stats[i]['draws']:>{col[2]}} "
-            f"{avg_rank:>{col[3]}.2f} "
-            f"{score:>{col[4]}.2f}"
+            f"{score:>{col[1]}.2f} "
+            f"{match_stats[i]['wins']:>{col[2]}} "
+            f"{match_stats[i]['draws']:>{col[3]}} "
+            f"{avg_rank:>{col[4]}.2f}"
         )
         print(colorize(row, c))
 
