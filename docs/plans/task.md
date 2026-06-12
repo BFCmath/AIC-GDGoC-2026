@@ -23,12 +23,7 @@
 | fix-win-draw-bug | Task 1: Fix Win/Draw Padded Agent Bug in benchmark.py | done | Verified with 2-match participant run. |
 | parallelize-benchmark | Task 2: Implement Multiprocessing in benchmark_6way.py | done | Implemented unbuffered multiprocessing and ran the 96-match rotate benchmark. |
 | run-benchmark-5rounds | Run 4x4 rotate benchmark for 5 matchups using benchmark_5rounds.py | done | Ran 80 matches benchmark successfully and reported results |
-
-
-
-
-
-
+| run-5way-fable-benchmark | Run 5-way rotate benchmark for codex/7, codex/15, codex/13, claude/2, and fable/1 | done | Completed 80-match benchmark; fable/1 takes 1st place! |
 
 
 
