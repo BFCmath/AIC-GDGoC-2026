@@ -26,6 +26,7 @@
 | run-5way-fable-benchmark | Run 5-way rotate benchmark for codex/7, codex/15, codex/13, claude/2, and fable/1 | done | Completed 80-match benchmark; fable/1 takes 1st place! |
 | run-6way-pool-240-matches | Run 6-agent pool 6C4 (240 matches) benchmark for Fable, Claude 2, Codex 7/15, and rules | done | Completed 240 matches benchmark; fable/1 takes 1st place! |
 | run-5way-v17-benchmark | Run 5-agent pool 5C4 (80 matches) benchmark for Fable, Codex 15, Codex 17, and rules | done | Completed 80-match benchmark; fable/1 takes 1st place! |
+| run-6way-fable2-benchmark | Run 6-agent pool 6C4 (240 matches) benchmark for Fable 1, Fable 2, Codex 15, and rules | done | Completed 240 matches benchmark; fable/1 takes 1st place, fable/2 in 2nd! |
 
 
 
