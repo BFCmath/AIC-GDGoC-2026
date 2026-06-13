@@ -28,6 +28,7 @@
 | run-5way-v17-benchmark | Run 5-agent pool 5C4 (80 matches) benchmark for Fable, Codex 15, Codex 17, and rules | done | Completed 80-match benchmark; fable/1 takes 1st place! |
 | run-6way-fable2-benchmark | Run 6-agent pool 6C4 (240 matches) benchmark for Fable 1, Fable 2, Codex 15, and rules | done | Completed 240 matches benchmark; fable/1 takes 1st place, fable/2 in 2nd! |
 | run-6way-strong-rules-benchmark | Run 6-agent pool 6C4 (240 matches) benchmark for Fable 1, Fable 2, Codex 15, Claude 2, Codex 7, and Genius | done | Completed 240 matches benchmark; fable/2 takes 1st place! |
+| run-8way-v18-benchmark | Run 8-agent pool 8C4 (280 matches) benchmark for Codex 18, Fable 1, Fable 2, Codex 15, Claude 2, Codex 7, Genius, and Simple | done | Completed 280 matches benchmark; codex/18 takes 1st place! |
 
 
 
